@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local user pricing & conversation model overrides
+data/pricing-overrides.json
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.log
+*.local
