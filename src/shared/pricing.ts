@@ -1,7 +1,12 @@
 import type {
   CostTotals,
+  CustomResetMarker,
+  LimitHitMarker,
   ModelPricing,
+  ModelProvider,
   PricingConfig,
+  QuotaPool,
+  ResetScheduleConfig,
   StepCostBreakdown,
   SubscriptionRoi,
   TokenTotals,
@@ -347,6 +352,37 @@ export const DEFAULT_MODELS: Record<string, ModelPricing> = {
   },
 };
 
+export function createDefaultResetConfig(): ResetScheduleConfig {
+  return {
+    fiveHourDurationHours: 5,
+    weeklyResetDayUtc: 1, // Monday 00:00 UTC
+    weeklyResetHourUtc: 0,
+    autoSyncOfficialResets: true,
+    syncedNext5hReset: {},
+    syncedNextWeeklyReset: {},
+    customResets: [],
+    limitHits: [],
+  };
+}
+
+/**
+ * Maps a model to Antigravity's two official quota pools:
+ *   - `'gemini'`     -> Gemini Models pool
+ *   - `'claude_gpt'` -> Claude & GPT Models pool
+ */
+export function getQuotaPoolForModel(
+  modelId: string | null | undefined,
+  provider?: ModelProvider,
+): QuotaPool {
+  if (provider === 'google') return 'gemini';
+  if (provider === 'anthropic' || provider === 'openai' || provider === 'deepseek') {
+    return 'claude_gpt';
+  }
+  const lower = (modelId ?? '').toLowerCase();
+  if (lower.includes('gemini')) return 'gemini';
+  return 'claude_gpt';
+}
+
 /**
  * Creates a fresh deep copy of the default PricingConfig.
  */
@@ -365,6 +401,7 @@ export function createDefaultPricingConfig(): PricingConfig {
     longContextOutputMultiplier: DEFAULT_LONG_CONTEXT_OUTPUT_MULTIPLIER,
     monthlySubscriptionUsd: DEFAULT_MONTHLY_SUBSCRIPTION_USD,
     conversationModelOverrides: {},
+    resetConfig: createDefaultResetConfig(),
   };
 }
 
@@ -455,6 +492,116 @@ export function mergePricingConfig(overrides?: Partial<PricingConfig> | null): P
       }
     }
     base.conversationModelOverrides = clean;
+  }
+
+  if (overrides.resetConfig && typeof overrides.resetConfig === 'object') {
+    const rc = overrides.resetConfig;
+    const mergedRc = createDefaultResetConfig();
+    if (
+      typeof rc.fiveHourDurationHours === 'number' &&
+      Number.isFinite(rc.fiveHourDurationHours) &&
+      rc.fiveHourDurationHours >= 1 &&
+      rc.fiveHourDurationHours <= 24
+    ) {
+      mergedRc.fiveHourDurationHours = rc.fiveHourDurationHours;
+    }
+    if (
+      typeof rc.weeklyResetDayUtc === 'number' &&
+      Number.isInteger(rc.weeklyResetDayUtc) &&
+      rc.weeklyResetDayUtc >= 0 &&
+      rc.weeklyResetDayUtc <= 6
+    ) {
+      mergedRc.weeklyResetDayUtc = rc.weeklyResetDayUtc;
+    }
+    if (
+      typeof rc.weeklyResetHourUtc === 'number' &&
+      Number.isInteger(rc.weeklyResetHourUtc) &&
+      rc.weeklyResetHourUtc >= 0 &&
+      rc.weeklyResetHourUtc <= 23
+    ) {
+      mergedRc.weeklyResetHourUtc = rc.weeklyResetHourUtc;
+    }
+    if (typeof rc.autoSyncOfficialResets === 'boolean') {
+      mergedRc.autoSyncOfficialResets = rc.autoSyncOfficialResets;
+    }
+    if (typeof rc.lastFeedSyncAt === 'string' && !Number.isNaN(Date.parse(rc.lastFeedSyncAt))) {
+      mergedRc.lastFeedSyncAt = new Date(rc.lastFeedSyncAt).toISOString();
+    }
+    if (rc.syncedNext5hReset && typeof rc.syncedNext5hReset === 'object') {
+      const next5: Partial<Record<QuotaPool, string>> = {};
+      for (const pool of ['gemini', 'claude_gpt'] as const) {
+        const val = rc.syncedNext5hReset[pool];
+        if (typeof val === 'string' && !Number.isNaN(Date.parse(val))) {
+          next5[pool] = new Date(val).toISOString();
+        }
+      }
+      mergedRc.syncedNext5hReset = next5;
+    }
+    if (rc.syncedNextWeeklyReset && typeof rc.syncedNextWeeklyReset === 'object') {
+      const nextW: Partial<Record<QuotaPool, string>> = {};
+      for (const pool of ['gemini', 'claude_gpt'] as const) {
+        const val = rc.syncedNextWeeklyReset[pool];
+        if (typeof val === 'string' && !Number.isNaN(Date.parse(val))) {
+          nextW[pool] = new Date(val).toISOString();
+        }
+      }
+      mergedRc.syncedNextWeeklyReset = nextW;
+    }
+    if (Array.isArray(rc.customResets)) {
+      const cleanResets: CustomResetMarker[] = [];
+      for (const item of rc.customResets.slice(0, 200)) {
+        if (!item || typeof item !== 'object') continue;
+        if (typeof item.timestamp !== 'string' || Number.isNaN(Date.parse(item.timestamp))) continue;
+        const scope =
+          item.scope === '5h' || item.scope === 'weekly' || item.scope === 'both'
+            ? item.scope
+            : 'both';
+        const pool =
+          item.pool === 'all' || item.pool === 'gemini' || item.pool === 'claude_gpt'
+            ? item.pool
+            : 'all';
+        const safeUrl =
+          typeof item.sourceUrl === 'string' &&
+          /^https:\/\/(geminireset\.com|antigravityreset\.com)\//.test(item.sourceUrl.trim())
+            ? item.sourceUrl.trim().slice(0, 240)
+            : undefined;
+        cleanResets.push({
+          id: typeof item.id === 'string' && item.id.trim() ? item.id.trim().slice(0, 64) : `rst-${cleanResets.length + 1}`,
+          timestamp: new Date(item.timestamp).toISOString(),
+          scope,
+          pool,
+          label:
+            typeof item.label === 'string' && item.label.trim()
+              ? item.label.trim().slice(0, 120)
+              : 'Server reset',
+          ...(item.source === 'geminireset' || item.source === 'manual'
+            ? { source: item.source }
+            : {}),
+          ...(safeUrl ? { sourceUrl: safeUrl } : {}),
+        });
+      }
+      mergedRc.customResets = cleanResets;
+    }
+    if (Array.isArray(rc.limitHits)) {
+      const cleanHits: LimitHitMarker[] = [];
+      for (const item of rc.limitHits.slice(0, 200)) {
+        if (!item || typeof item !== 'object') continue;
+        if (typeof item.timestamp !== 'string' || Number.isNaN(Date.parse(item.timestamp))) continue;
+        const scope = item.scope === '5h' || item.scope === 'weekly' ? item.scope : '5h';
+        const pool: QuotaPool = item.pool === 'claude_gpt' ? 'claude_gpt' : 'gemini';
+        cleanHits.push({
+          id: typeof item.id === 'string' && item.id.trim() ? item.id.trim().slice(0, 64) : `hit-${cleanHits.length + 1}`,
+          timestamp: new Date(item.timestamp).toISOString(),
+          scope,
+          pool,
+          ...(typeof item.note === 'string' && item.note.trim()
+            ? { note: item.note.trim().slice(0, 160) }
+            : {}),
+        });
+      }
+      mergedRc.limitHits = cleanHits;
+    }
+    base.resetConfig = mergedRc;
   }
 
   return base;

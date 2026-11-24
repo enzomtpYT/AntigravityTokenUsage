@@ -13,12 +13,20 @@ import {
   Search,
   ShieldCheck,
   Sun,
+  Timer,
   X,
 } from 'lucide-react';
 import type { ConnectionStatus } from '../hooks/useDashboardData';
 import { cn, formatRelativeTime } from '../utils/format';
 
-export type NavTab = 'overview' | 'projects' | 'conversations' | 'swarms' | 'models' | 'efficiency';
+export type NavTab =
+  | 'overview'
+  | 'projects'
+  | 'conversations'
+  | 'swarms'
+  | 'resets'
+  | 'models'
+  | 'efficiency';
 
 interface NavItem {
   id: NavTab;
@@ -51,6 +59,12 @@ const NAV_ITEMS: NavItem[] = [
     label: 'Swarms & Agents',
     description: 'Gantt waterfall & agent roles',
     icon: Network,
+  },
+  {
+    id: 'resets',
+    label: 'Quota & Resets',
+    description: '5h & weekly reset cycles',
+    icon: Timer,
   },
   {
     id: 'models',

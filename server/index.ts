@@ -4,7 +4,15 @@ import {
   createDefaultPricingConfig,
   mergePricingConfig,
 } from '../src/shared/pricing.ts';
-import type { DashboardPayload, ModelPricing, PricingConfig } from '../src/shared/types.ts';
+import type {
+  CustomResetMarker,
+  DashboardPayload,
+  LimitHitMarker,
+  ModelPricing,
+  PricingConfig,
+  QuotaPool,
+  ResetScheduleConfig,
+} from '../src/shared/types.ts';
 import {
   buildConversationDetail,
   buildDashboardPayload,
@@ -15,6 +23,7 @@ import {
   getDefaultDataDir,
   type LoadedDataset,
 } from './data-loader.ts';
+import { fetchGeminiResetFeed } from './reset-feed.ts';
 import { AntigravityWatcher } from './watcher.ts';
 
 const LOCALHOST_ORIGIN_RE = /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/;
@@ -132,6 +141,157 @@ function loadPricingOverrides(overridesPath: string): PricingConfig {
   } catch {
     return createDefaultPricingConfig();
   }
+}
+
+export function validateAndSanitizeResetConfig(
+  raw: unknown,
+): { ok: true; resetConfig: ResetScheduleConfig } | { ok: false; error: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: 'resetConfig must be a JSON object' };
+  }
+  const obj = raw as Record<string, unknown>;
+  for (const k of Object.keys(obj)) {
+    if (DANGEROUS_KEYS.has(k)) {
+      return { ok: false, error: `Disallowed key "${k}" in resetConfig` };
+    }
+  }
+
+  const fiveHourDurationHours =
+    obj.fiveHourDurationHours !== undefined ? Number(obj.fiveHourDurationHours) : 5;
+  if (!Number.isFinite(fiveHourDurationHours) || fiveHourDurationHours < 1 || fiveHourDurationHours > 24) {
+    return { ok: false, error: 'fiveHourDurationHours must be between 1 and 24' };
+  }
+
+  const weeklyResetDayUtc =
+    obj.weeklyResetDayUtc !== undefined ? Number(obj.weeklyResetDayUtc) : 1;
+  if (!Number.isInteger(weeklyResetDayUtc) || weeklyResetDayUtc < 0 || weeklyResetDayUtc > 6) {
+    return { ok: false, error: 'weeklyResetDayUtc must be an integer 0..6' };
+  }
+
+  const weeklyResetHourUtc =
+    obj.weeklyResetHourUtc !== undefined ? Number(obj.weeklyResetHourUtc) : 0;
+  if (!Number.isInteger(weeklyResetHourUtc) || weeklyResetHourUtc < 0 || weeklyResetHourUtc > 23) {
+    return { ok: false, error: 'weeklyResetHourUtc must be an integer 0..23' };
+  }
+
+  let autoSyncOfficialResets = true;
+  if (obj.autoSyncOfficialResets !== undefined) {
+    if (typeof obj.autoSyncOfficialResets !== 'boolean') {
+      return { ok: false, error: 'autoSyncOfficialResets must be a boolean' };
+    }
+    autoSyncOfficialResets = obj.autoSyncOfficialResets;
+  }
+
+  const lastFeedSyncAt =
+    typeof obj.lastFeedSyncAt === 'string' &&
+    obj.lastFeedSyncAt.trim() &&
+    !Number.isNaN(Date.parse(obj.lastFeedSyncAt))
+      ? new Date(obj.lastFeedSyncAt).toISOString()
+      : undefined;
+
+  const sanitizeSyncedMap = (input: unknown): Partial<Record<QuotaPool, string>> => {
+    const out: Partial<Record<QuotaPool, string>> = {};
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
+    const m = input as Record<string, unknown>;
+    for (const pool of ['gemini', 'claude_gpt'] as const) {
+      const val = m[pool];
+      if (typeof val === 'string' && val.trim() && !Number.isNaN(Date.parse(val))) {
+        out[pool] = new Date(val).toISOString();
+      }
+    }
+    return out;
+  };
+
+  const customResets: CustomResetMarker[] = [];
+  if (obj.customResets !== undefined) {
+    if (!Array.isArray(obj.customResets)) {
+      return { ok: false, error: 'customResets must be an array' };
+    }
+    if (obj.customResets.length > 200) {
+      return { ok: false, error: 'Too many customResets (max 200)' };
+    }
+    for (const item of obj.customResets) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return { ok: false, error: 'Each customReset must be an object' };
+      }
+      const r = item as Record<string, unknown>;
+      if (typeof r.timestamp !== 'string' || Number.isNaN(Date.parse(r.timestamp))) {
+        return { ok: false, error: 'Each customReset must have a valid ISO timestamp' };
+      }
+      const scope =
+        r.scope === '5h' || r.scope === 'weekly' || r.scope === 'both' ? r.scope : 'both';
+      const pool =
+        r.pool === 'all' || r.pool === 'gemini' || r.pool === 'claude_gpt' ? r.pool : 'all';
+      const safeSourceUrl =
+        typeof r.sourceUrl === 'string' &&
+        /^https:\/\/(geminireset\.com|antigravityreset\.com)\//.test(r.sourceUrl.trim())
+          ? r.sourceUrl.trim().slice(0, 240)
+          : undefined;
+      customResets.push({
+        id:
+          typeof r.id === 'string' && r.id.trim()
+            ? r.id.trim().slice(0, 64)
+            : `rst-${Date.now()}-${customResets.length}`,
+        timestamp: new Date(r.timestamp).toISOString(),
+        scope,
+        pool,
+        label:
+          typeof r.label === 'string' && r.label.trim()
+            ? r.label.trim().slice(0, 120)
+            : 'Server reset',
+        ...(r.source === 'geminireset' || r.source === 'manual' ? { source: r.source } : {}),
+        ...(safeSourceUrl ? { sourceUrl: safeSourceUrl } : {}),
+      });
+    }
+  }
+
+  const limitHits: LimitHitMarker[] = [];
+  if (obj.limitHits !== undefined) {
+    if (!Array.isArray(obj.limitHits)) {
+      return { ok: false, error: 'limitHits must be an array' };
+    }
+    if (obj.limitHits.length > 200) {
+      return { ok: false, error: 'Too many limitHits (max 200)' };
+    }
+    for (const item of obj.limitHits) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return { ok: false, error: 'Each limitHit must be an object' };
+      }
+      const h = item as Record<string, unknown>;
+      if (typeof h.timestamp !== 'string' || Number.isNaN(Date.parse(h.timestamp))) {
+        return { ok: false, error: 'Each limitHit must have a valid ISO timestamp' };
+      }
+      const scope = h.scope === '5h' || h.scope === 'weekly' ? h.scope : '5h';
+      const pool: QuotaPool = h.pool === 'claude_gpt' ? 'claude_gpt' : 'gemini';
+      limitHits.push({
+        id:
+          typeof h.id === 'string' && h.id.trim()
+            ? h.id.trim().slice(0, 64)
+            : `hit-${Date.now()}-${limitHits.length}`,
+        timestamp: new Date(h.timestamp).toISOString(),
+        scope,
+        pool,
+        ...(typeof h.note === 'string' && h.note.trim()
+          ? { note: h.note.trim().slice(0, 160) }
+          : {}),
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    resetConfig: {
+      fiveHourDurationHours,
+      weeklyResetDayUtc,
+      weeklyResetHourUtc,
+      autoSyncOfficialResets,
+      ...(lastFeedSyncAt ? { lastFeedSyncAt } : {}),
+      syncedNext5hReset: sanitizeSyncedMap(obj.syncedNext5hReset),
+      syncedNextWeeklyReset: sanitizeSyncedMap(obj.syncedNextWeeklyReset),
+      customResets,
+      limitHits,
+    },
+  };
 }
 
 export function validateAndSanitizePricingUpdate(
@@ -295,6 +455,14 @@ export function validateAndSanitizePricingUpdate(
     overrides.models = { ...sanitizedModels };
   }
 
+  if (raw.resetConfig !== undefined) {
+    const rcCheck = validateAndSanitizeResetConfig(raw.resetConfig);
+    if (!rcCheck.ok) {
+      return { ok: false, error: rcCheck.error };
+    }
+    overrides.resetConfig = rcCheck.resetConfig;
+  }
+
   return { ok: true, overrides };
 }
 
@@ -305,7 +473,11 @@ export interface ServerOptions {
   overridesPath?: string;
   distDir?: string;
   enableWatcher?: boolean;
+  /** Auto-fetch confirmed resets from geminireset.com/feed.xml on startup when enabled in resetConfig */
+  enableAutoFeedSync?: boolean;
 }
+
+const AUTO_FEED_SYNC_COOLDOWN_MS = 15 * 60_000; // 15 minutes
 
 export function createAppServer(options: ServerOptions = {}) {
   const port = options.port ?? Number(process.env.PORT ?? 3001);
@@ -315,6 +487,7 @@ export function createAppServer(options: ServerOptions = {}) {
     options.overridesPath ?? path.resolve(process.cwd(), 'data', 'pricing-overrides.json');
   const distDir = options.distDir ?? path.resolve(process.cwd(), 'dist');
   const enableWatcher = options.enableWatcher ?? true;
+  const enableAutoFeedSync = options.enableAutoFeedSync ?? enableWatcher;
 
   const loader = new AntigravityDataLoader(dataDir);
   let pricingConfig: PricingConfig = loadPricingOverrides(overridesPath);
@@ -367,6 +540,73 @@ export function createAppServer(options: ServerOptions = {}) {
     }
   }
 
+  let feedSyncInFlight: Promise<{
+    added: number;
+    totalFeedMarkers: number;
+    sourceUrl: string;
+    fetchedAt: string;
+    resetConfig: ResetScheduleConfig;
+  }> | null = null;
+
+  async function runOfficialFeedSync() {
+    if (feedSyncInFlight) return feedSyncInFlight;
+    feedSyncInFlight = (async () => {
+      const result = await fetchGeminiResetFeed();
+      const existing = pricingConfig.resetConfig.customResets;
+      const existingIds = new Set(existing.map((m) => m.id));
+      const existingTimestamps = new Set(existing.map((m) => m.timestamp));
+
+      const merged = [...existing];
+      let added = 0;
+      for (const marker of result.markers) {
+        if (existingIds.has(marker.id) || existingTimestamps.has(marker.timestamp)) {
+          continue;
+        }
+        if (merged.length >= 200) break;
+        merged.push(marker);
+        existingIds.add(marker.id);
+        existingTimestamps.add(marker.timestamp);
+        added += 1;
+      }
+
+      merged.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+
+      pricingConfig = mergePricingConfig({
+        ...pricingConfig,
+        resetConfig: {
+          ...pricingConfig.resetConfig,
+          customResets: merged,
+          lastFeedSyncAt: result.fetchedAt,
+        },
+      });
+      pricingVersion += 1;
+      dashboardCache.clear();
+
+      fs.mkdirSync(path.dirname(overridesPath), { recursive: true });
+      fs.writeFileSync(overridesPath, JSON.stringify(pricingConfig, null, 2), 'utf8');
+
+      broadcastSseEvent('update', {
+        type: 'update',
+        reason: 'reset-feed-sync',
+        timestamp: new Date().toISOString(),
+      });
+
+      return {
+        added,
+        totalFeedMarkers: result.markers.length,
+        sourceUrl: result.sourceUrl,
+        fetchedAt: result.fetchedAt,
+        resetConfig: pricingConfig.resetConfig,
+      };
+    })();
+
+    try {
+      return await feedSyncInFlight;
+    } finally {
+      feedSyncInFlight = null;
+    }
+  }
+
   const watcher = new AntigravityWatcher(dataDir, 400);
   if (enableWatcher) {
     watcher.onChange((reason) => {
@@ -382,6 +622,29 @@ export function createAppServer(options: ServerOptions = {}) {
 
   // Warm initial load
   getDataset();
+
+  // Optional non-blocking startup auto-sync of confirmed Google server resets
+  if (enableAutoFeedSync && pricingConfig.resetConfig.autoSyncOfficialResets !== false) {
+    const lastSyncMs = pricingConfig.resetConfig.lastFeedSyncAt
+      ? Date.parse(pricingConfig.resetConfig.lastFeedSyncAt)
+      : NaN;
+    const isFresh = !Number.isNaN(lastSyncMs) && Date.now() - lastSyncMs < AUTO_FEED_SYNC_COOLDOWN_MS;
+    if (!isFresh) {
+      void runOfficialFeedSync()
+        .then((res) => {
+          if (res.added > 0) {
+            console.log(
+              `[antigravity-token-usage] Auto-synced ${res.added} confirmed server reset(s) from ${res.sourceUrl}`,
+            );
+          }
+        })
+        .catch((err) => {
+          console.warn(
+            `[antigravity-token-usage] Startup reset feed auto-sync skipped: ${err instanceof Error ? err.message : 'Network error'}`,
+          );
+        });
+    }
+  }
 
   const server = Bun.serve({
     port,
@@ -540,6 +803,63 @@ export function createAppServer(options: ServerOptions = {}) {
         });
 
         return jsonResponse(req, pricingConfig);
+      }
+
+      if (pathname === '/api/resets' && req.method === 'PUT') {
+        const parsed = await readBoundedJson(req);
+        if (!parsed.ok) {
+          return jsonResponse(req, { error: parsed.error }, parsed.status);
+        }
+
+        const validation = validateAndSanitizeResetConfig(parsed.data);
+        if (!validation.ok) {
+          return jsonResponse(req, { error: validation.error }, 400);
+        }
+
+        pricingConfig = mergePricingConfig({
+          ...pricingConfig,
+          resetConfig: {
+            ...validation.resetConfig,
+            ...(validation.resetConfig.lastFeedSyncAt ?? pricingConfig.resetConfig.lastFeedSyncAt
+              ? {
+                  lastFeedSyncAt:
+                    validation.resetConfig.lastFeedSyncAt ?? pricingConfig.resetConfig.lastFeedSyncAt,
+                }
+              : {}),
+          },
+        });
+        pricingVersion += 1;
+        dashboardCache.clear();
+
+        try {
+          fs.mkdirSync(path.dirname(overridesPath), { recursive: true });
+          fs.writeFileSync(overridesPath, JSON.stringify(pricingConfig, null, 2), 'utf8');
+        } catch {
+          return jsonResponse(req, { error: 'Failed to persist reset config' }, 500);
+        }
+
+        broadcastSseEvent('update', {
+          type: 'update',
+          reason: 'reset-config',
+          timestamp: new Date().toISOString(),
+        });
+
+        return jsonResponse(req, pricingConfig.resetConfig);
+      }
+
+      if (pathname === '/api/resets/sync-feed' && req.method === 'POST') {
+        try {
+          const synced = await runOfficialFeedSync();
+          return jsonResponse(req, synced);
+        } catch (err) {
+          return jsonResponse(
+            req,
+            {
+              error: `Failed to sync reset feed: ${err instanceof Error ? err.message : 'Network error'}`,
+            },
+            502,
+          );
+        }
       }
 
       if (pathname === '/api/pricing/reset' && req.method === 'POST') {

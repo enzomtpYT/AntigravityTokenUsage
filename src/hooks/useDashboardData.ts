@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDefaultPricingConfig } from '../shared/pricing';
-import type { DashboardPayload, PricingConfig } from '../shared/types';
+import type { DashboardPayload, PricingConfig, ResetScheduleConfig } from '../shared/types';
 import type { LiveTokenDelta } from '../components/LiveToast';
 
-export type DatePreset = '7d' | '30d' | 'all' | 'custom';
+export type DatePreset = '5h' | 'cycle' | '7d' | '30d' | 'all' | 'custom';
 export type ConnectionStatus = 'connecting' | 'live' | 'reconnecting';
 
 export interface DashboardFilterState {
   datePreset: DatePreset;
   startDate: string;
   endDate: string;
+  customRangeLabel?: string;
   projectId: string;
   model: string;
   includeSubagents: boolean;
@@ -59,6 +60,7 @@ export interface UseDashboardDataResult {
   setDatePreset: (preset: DatePreset) => void;
   setStartDate: (date: string) => void;
   setEndDate: (date: string) => void;
+  applyTimeRange: (startIso: string, endIso: string, label?: string) => void;
   setProjectId: (projectId: string) => void;
   setModel: (model: string) => void;
   setIncludeSubagents: (include: boolean) => void;
@@ -67,6 +69,8 @@ export interface UseDashboardDataResult {
   refresh: () => Promise<void>;
   savePricing: (next: PricingConfig) => Promise<void>;
   resetPricing: () => Promise<void>;
+  saveResetConfig: (next: ResetScheduleConfig) => Promise<void>;
+  syncResetFeed: () => Promise<{ added: number; totalFeedMarkers: number; sourceUrl: string }>;
   setConversationModelOverride: (conversationId: string, modelId: string | null) => Promise<void>;
   liveDelta: LiveTokenDelta | null;
   dismissLiveDelta: () => void;
@@ -149,6 +153,16 @@ export function useDashboardData(): UseDashboardDataResult {
           payload.pricing.longContextEnabled,
           payload.pricing.monthlySubscriptionUsd,
           Object.keys(payload.pricing.conversationModelOverrides ?? {}).length,
+          payload.resetAnalytics?.config?.customResets?.length ?? 0,
+          payload.resetAnalytics?.config?.limitHits?.length ?? 0,
+          payload.resetAnalytics?.config?.autoSyncOfficialResets ?? true,
+          payload.resetAnalytics?.config?.lastFeedSyncAt ?? '',
+          payload.resetAnalytics?.current5h?.startAt ?? '',
+          payload.resetAnalytics?.currentWeekly?.startAt ?? '',
+          payload.resetAnalytics?.pools?.gemini?.current5h?.endAt ?? '',
+          payload.resetAnalytics?.pools?.gemini?.currentWeekly?.endAt ?? '',
+          payload.resetAnalytics?.pools?.claude_gpt?.current5h?.endAt ?? '',
+          payload.resetAnalytics?.pools?.claude_gpt?.currentWeekly?.endAt ?? '',
         ]);
 
         // Skip redundant React state updates on silent SSE pings if nothing actually changed
@@ -268,9 +282,40 @@ export function useDashboardData(): UseDashboardDataResult {
     };
   }, []);
 
+  const dataRef = useRef<DashboardPayload | null>(null);
+  dataRef.current = data;
+
   const setDatePreset = useCallback((preset: DatePreset) => {
     if (preset === 'custom') {
-      setFilters((prev) => ({ ...prev, datePreset: 'custom' }));
+      setFilters((prev) => ({ ...prev, datePreset: 'custom', customRangeLabel: undefined }));
+      return;
+    }
+    if (preset === '5h') {
+      const cur = dataRef.current?.resetAnalytics?.current5h;
+      const now = new Date();
+      const startIso = cur?.startAt ?? new Date(now.getTime() - 5 * 3_600_000).toISOString();
+      const endIso = cur?.endAt ?? now.toISOString();
+      setFilters((prev) => ({
+        ...prev,
+        datePreset: '5h',
+        startDate: startIso,
+        endDate: endIso,
+        customRangeLabel: `Current 5h (${cur?.label ?? 'Live'})`,
+      }));
+      return;
+    }
+    if (preset === 'cycle') {
+      const cur = dataRef.current?.resetAnalytics?.currentWeekly;
+      const now = new Date();
+      const startIso = cur?.startAt ?? new Date(now.getTime() - 7 * 86_400_000).toISOString();
+      const endIso = cur?.endAt ?? now.toISOString();
+      setFilters((prev) => ({
+        ...prev,
+        datePreset: 'cycle',
+        startDate: startIso,
+        endDate: endIso,
+        customRangeLabel: `Current Week (${cur?.label ?? 'Live'})`,
+      }));
       return;
     }
     const range = computePresetRange(preset);
@@ -279,6 +324,17 @@ export function useDashboardData(): UseDashboardDataResult {
       datePreset: preset,
       startDate: range.startDate,
       endDate: range.endDate,
+      customRangeLabel: undefined,
+    }));
+  }, []);
+
+  const applyTimeRange = useCallback((startIso: string, endIso: string, label?: string) => {
+    setFilters((prev) => ({
+      ...prev,
+      datePreset: 'custom',
+      startDate: startIso,
+      endDate: endIso,
+      customRangeLabel: label,
     }));
   }, []);
 
@@ -287,6 +343,7 @@ export function useDashboardData(): UseDashboardDataResult {
       ...prev,
       datePreset: startDate || prev.endDate ? 'custom' : 'all',
       startDate,
+      customRangeLabel: undefined,
     }));
   }, []);
 
@@ -295,6 +352,7 @@ export function useDashboardData(): UseDashboardDataResult {
       ...prev,
       datePreset: prev.startDate || endDate ? 'custom' : 'all',
       endDate,
+      customRangeLabel: undefined,
     }));
   }, []);
 
@@ -351,6 +409,49 @@ export function useDashboardData(): UseDashboardDataResult {
     await fetchDashboard(false);
   }, [fetchDashboard]);
 
+  const saveResetConfig = useCallback(
+    async (next: ResetScheduleConfig) => {
+      const res = await fetch('/api/resets', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(next),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => null);
+        throw new Error(errBody?.error || `Failed to save reset config (${res.status})`);
+      }
+      const saved: ResetScheduleConfig = await res.json();
+      setPricing((prev) => ({ ...prev, resetConfig: saved }));
+      await fetchDashboard(false);
+    },
+    [fetchDashboard],
+  );
+
+  const syncResetFeed = useCallback(async () => {
+    const res = await fetch('/api/resets/sync-feed', {
+      method: 'POST',
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => null);
+      throw new Error(errBody?.error || `Failed to sync reset feed (${res.status})`);
+    }
+    const result: {
+      added: number;
+      totalFeedMarkers: number;
+      sourceUrl: string;
+      resetConfig: ResetScheduleConfig;
+    } = await res.json();
+    if (result.resetConfig) {
+      setPricing((prev) => ({ ...prev, resetConfig: result.resetConfig }));
+    }
+    await fetchDashboard(false);
+    return {
+      added: result.added,
+      totalFeedMarkers: result.totalFeedMarkers,
+      sourceUrl: result.sourceUrl,
+    };
+  }, [fetchDashboard]);
+
   const setConversationModelOverride = useCallback(
     async (conversationId: string, modelId: string | null) => {
       const res = await fetch(
@@ -388,6 +489,7 @@ export function useDashboardData(): UseDashboardDataResult {
     setDatePreset,
     setStartDate,
     setEndDate,
+    applyTimeRange,
     setProjectId,
     setModel,
     setIncludeSubagents,
@@ -396,6 +498,8 @@ export function useDashboardData(): UseDashboardDataResult {
     refresh,
     savePricing,
     resetPricing,
+    saveResetConfig,
+    syncResetFeed,
     setConversationModelOverride,
     liveDelta,
     dismissLiveDelta,

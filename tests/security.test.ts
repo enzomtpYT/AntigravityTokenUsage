@@ -171,5 +171,57 @@ describe('Backend Security Hardening', () => {
     const resLeak = await fetch(`${baseUrl}/leak.txt`);
     const leakBody = await resLeak.text();
     expect(leakBody).not.toContain('TOP_SECRET_VALUE');
+
+    // 8. PUT /api/resets enforces CSRF origin check and persists valid reset cutlines
+    const resResetCsrf = await fetch(`${baseUrl}/api/resets`, {
+      method: 'PUT',
+      headers: { Origin: 'https://evil.example', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fiveHourDurationHours: 5 }),
+    });
+    expect(resResetCsrf.status).toBe(403);
+
+    const resResetOk = await fetch(`${baseUrl}/api/resets`, {
+      method: 'PUT',
+      headers: { Origin: 'http://localhost:5173', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fiveHourDurationHours: 5,
+        weeklyResetDayUtc: 1,
+        weeklyResetHourUtc: 0,
+        autoSyncOfficialResets: false,
+        customResets: [
+          {
+            id: 'rst-1',
+            timestamp: '2026-11-23T14:00:00.000Z',
+            scope: 'both',
+            pool: 'all',
+            label: 'Google bonus reset',
+            sourceUrl: 'javascript:alert(1)',
+          },
+        ],
+        limitHits: [],
+      }),
+    });
+    expect(resResetOk.status).toBe(200);
+    const savedRc = await resResetOk.json();
+    expect(savedRc.autoSyncOfficialResets).toBe(false);
+    expect(savedRc.customResets).toHaveLength(1);
+    expect(savedRc.customResets[0].label).toBe('Google bonus reset');
+    // Unsafe javascript: sourceUrl must be stripped
+    expect(savedRc.customResets[0].sourceUrl).toBeUndefined();
+
+    // Non-boolean autoSyncOfficialResets must be rejected
+    const resResetBadAuto = await fetch(`${baseUrl}/api/resets`, {
+      method: 'PUT',
+      headers: { Origin: 'http://localhost:5173', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ autoSyncOfficialResets: 'yes' }),
+    });
+    expect(resResetBadAuto.status).toBe(400);
+
+    // 9. POST /api/resets/sync-feed enforces CSRF origin check
+    const resFeedCsrf = await fetch(`${baseUrl}/api/resets/sync-feed`, {
+      method: 'POST',
+      headers: { Origin: 'https://evil.example' },
+    });
+    expect(resFeedCsrf.status).toBe(403);
   });
 });

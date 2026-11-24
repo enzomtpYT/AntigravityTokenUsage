@@ -3,8 +3,10 @@ import {
   calculateSubscriptionRoi,
   calculateWhatIfComparisons,
   computeTokenTotals,
+  createDefaultResetConfig,
   createEmptyCostTotals,
   createEmptyTokenTotals,
+  getQuotaPoolForModel,
   resolveModelPricing,
   type LongContextOptions,
 } from '../src/shared/pricing.ts';
@@ -15,6 +17,7 @@ import type {
   ConversationDetailResponse,
   ConversationSummary,
   CostTotals,
+  CustomResetMarker,
   DashboardFilters,
   DashboardKpis,
   DashboardPayload,
@@ -23,13 +26,22 @@ import type {
   ExpensiveTurn,
   FunInsights,
   HourDayCell,
+  LimitHitMarker,
   MetricBundle,
   ModelProvider,
   ModelStat,
   PeriodDeltas,
+  PoolLimitEstimate,
+  PoolMetrics,
+  PoolResetTimeline,
   PricingConfig,
   ProjectErrorCost,
   ProjectSummary,
+  QuotaPool,
+  ResetAnalytics,
+  ResetCycleSummary,
+  ResetEventPool,
+  ResetScheduleConfig,
   SankeyData,
   SankeyLink,
   SankeyNode,
@@ -1799,6 +1811,19 @@ export function buildDashboardPayload(
     .sort((a, b) => b.cost - a.cost)
     .slice(0, 25);
 
+  // 10b. Build Quota & Reset Window Analytics (ignoring startDate/endDate filter so all cycles remain selectable)
+  const resetAnalytics = buildResetAnalytics(
+    dataset,
+    pricing,
+    {
+      includeSubagents: filters.includeSubagents,
+      projectId: projectFilter,
+      model: modelFilter,
+      search: searchQuery,
+    },
+    now,
+  );
+
   const appliedFilters: DashboardFilters = {
     ...(filters.startDate ? { startDate: filters.startDate } : {}),
     ...(filters.endDate ? { endDate: filters.endDate } : {}),
@@ -1819,6 +1844,7 @@ export function buildDashboardPayload(
     funInsights,
     periodDeltas,
     toolChains,
+    resetAnalytics,
     sankey,
     scatterTurns,
     swarmAnalytics,
@@ -2193,3 +2219,698 @@ export function buildConversationDetail(
 }
 
 export { createEmptyMetricBundle };
+
+// ============================================================================
+// Quota & Reset Window Reconstruction Engine (5h Rolling + Weekly + Cutlines)
+// ============================================================================
+
+interface ResetStepEvent {
+  tsMs: number;
+  conversationId: string;
+  projectDisplayName: string;
+  model: string;
+  pool: QuotaPool;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  cost: StepCostBreakdown;
+  isTokenBearing: boolean;
+  hasError: boolean;
+  isCacheMissSpike: boolean;
+}
+
+interface RawWindowDef {
+  startMs: number;
+  endMs: number;
+  isCurrent: boolean;
+  isIdle?: boolean;
+  isSynced?: boolean;
+  endedEarlyByServerReset: boolean;
+  startedByServerReset: boolean;
+  serverResetLabel?: string;
+}
+
+function doesResetApplyToPool(markerPool: ResetEventPool, targetPool: ResetEventPool): boolean {
+  if (targetPool === 'all') return true;
+  return markerPool === 'all' || markerPool === targetPool;
+}
+
+function filterEventsForPool(
+  events: ResetStepEvent[],
+  targetPool: ResetEventPool,
+): ResetStepEvent[] {
+  if (targetPool === 'all') return events;
+  return events.filter((e) => e.pool === targetPool);
+}
+
+function createEmptyPoolAcc() {
+  return {
+    uncachedInput: 0,
+    cacheRead: 0,
+    output: 0,
+    cost: createEmptyCostTotals(),
+    steps: 0,
+    tokenSteps: 0,
+    conversations: new Set<string>(),
+    modelCost: new Map<string, number>(),
+    projectCost: new Map<string, number>(),
+  };
+}
+
+function finalizePoolAcc(acc: ReturnType<typeof createEmptyPoolAcc>): PoolMetrics {
+  let topModel: string | null = null;
+  let topModelCost = -1;
+  for (const [m, c] of acc.modelCost.entries()) {
+    if (c > topModelCost) {
+      topModelCost = c;
+      topModel = m;
+    }
+  }
+  let topProject: string | null = null;
+  let topProjCost = -1;
+  for (const [p, c] of acc.projectCost.entries()) {
+    if (c > topProjCost) {
+      topProjCost = c;
+      topProject = p;
+    }
+  }
+  return {
+    tokens: computeTokenTotals(acc.uncachedInput, acc.cacheRead, acc.output),
+    cost: acc.cost,
+    steps: acc.steps,
+    tokenSteps: acc.tokenSteps,
+    conversations: acc.conversations.size,
+    topModel,
+    topProject,
+  };
+}
+
+function formatWindowLabel(startMs: number, endMs: number, scope: '5h' | 'weekly'): string {
+  const s = new Date(startMs);
+  const e = new Date(endMs);
+  const sm = MONTH_NAMES[s.getUTCMonth()];
+  const sd = s.getUTCDate();
+  const em = MONTH_NAMES[e.getUTCMonth()];
+  const ed = e.getUTCDate();
+
+  if (scope === 'weekly') {
+    return sm === em ? `${sm} ${sd}–${ed}` : `${sm} ${sd} – ${em} ${ed}`;
+  }
+  const sh = String(s.getUTCHours()).padStart(2, '0');
+  const smin = String(s.getUTCMinutes()).padStart(2, '0');
+  const eh = String(e.getUTCHours()).padStart(2, '0');
+  const emin = String(e.getUTCMinutes()).padStart(2, '0');
+  return `${sm} ${sd} ${sh}:${smin}–${eh}:${emin}Z`;
+}
+
+function aggregateCycle(
+  def: RawWindowDef,
+  scope: '5h' | 'weekly',
+  events: ResetStepEvent[],
+  limitHits: LimitHitMarker[],
+  index: number,
+  targetPool: ResetEventPool,
+): ResetCycleSummary {
+  const combinedAcc = createEmptyPoolAcc();
+  const geminiAcc = createEmptyPoolAcc();
+  const claudeAcc = createEmptyPoolAcc();
+  const byModelCost: Record<string, number> = {};
+  const byModelTokens: Record<string, number> = {};
+  let errorCount = 0;
+  let cacheMissSpikes = 0;
+
+  for (const ev of events) {
+    if (ev.tsMs < def.startMs || ev.tsMs >= def.endMs) continue;
+    if (targetPool !== 'all' && ev.pool !== targetPool) continue;
+    const targetAcc = ev.pool === 'gemini' ? geminiAcc : claudeAcc;
+    for (const acc of [combinedAcc, targetAcc]) {
+      acc.steps += 1;
+      acc.conversations.add(ev.conversationId);
+      if (ev.isTokenBearing) {
+        acc.tokenSteps += 1;
+        acc.uncachedInput += ev.inputTokens;
+        acc.cacheRead += ev.cacheReadTokens;
+        acc.output += ev.outputTokens;
+        addCostTotals(acc.cost, ev.cost);
+        acc.modelCost.set(ev.model, (acc.modelCost.get(ev.model) ?? 0) + ev.cost.totalCost);
+        acc.projectCost.set(
+          ev.projectDisplayName,
+          (acc.projectCost.get(ev.projectDisplayName) ?? 0) + ev.cost.totalCost,
+        );
+      }
+    }
+    if (ev.isTokenBearing) {
+      byModelCost[ev.model] = (byModelCost[ev.model] ?? 0) + ev.cost.totalCost;
+      byModelTokens[ev.model] =
+        (byModelTokens[ev.model] ?? 0) + ev.inputTokens + ev.cacheReadTokens + ev.outputTokens;
+    }
+    if (ev.hasError) errorCount += 1;
+    if (ev.isCacheMissSpike) cacheMissSpikes += 1;
+  }
+
+  const combined = finalizePoolAcc(combinedAcc);
+  const gemini = finalizePoolAcc(geminiAcc);
+  const claudeGpt = finalizePoolAcc(claudeAcc);
+
+  const cycleHits = limitHits.filter((h) => {
+    if (h.scope !== scope) return false;
+    if (targetPool !== 'all' && h.pool !== targetPool) return false;
+    const t = Date.parse(h.timestamp);
+    return !Number.isNaN(t) && t >= def.startMs && t < def.endMs;
+  });
+
+  const eff = computeEfficiencyScore({
+    cacheHitRatio: combined.tokens.cacheHitRatio,
+    tokenStepCount: combined.tokenSteps,
+    stepCount: combined.steps,
+    cacheMissSpikes,
+    errorCount,
+    outputTokens: combined.tokens.output,
+    uncachedInputTokens: combined.tokens.uncachedInput,
+  });
+
+  const isIdle =
+    scope === '5h' &&
+    def.isCurrent &&
+    !def.isSynced &&
+    (def.isIdle || combined.tokenSteps === 0);
+
+  return {
+    id: `${targetPool}-${scope}-${def.startMs}-${index}`,
+    scope,
+    startAt: new Date(def.startMs).toISOString(),
+    endAt: new Date(def.endMs).toISOString(),
+    label: formatWindowLabel(def.startMs, def.endMs, scope),
+    isCurrent: def.isCurrent,
+    ...(isIdle ? { isIdle: true } : {}),
+    ...(def.isSynced ? { isSynced: true } : {}),
+    endedEarlyByServerReset: def.endedEarlyByServerReset,
+    startedByServerReset: def.startedByServerReset,
+    ...(def.serverResetLabel ? { serverResetLabel: def.serverResetLabel } : {}),
+    limitHits: cycleHits,
+    combined,
+    gemini,
+    claudeGpt,
+    byModelCost,
+    byModelTokens,
+    efficiencyScore: eff.score,
+    efficiencyGrade: eff.grade,
+  };
+}
+
+function buildFiveHourWindows(
+  events: ResetStepEvent[],
+  config: ResetScheduleConfig,
+  nowMs: number,
+  targetPool: ResetEventPool,
+): RawWindowDef[] {
+  const durationMs = Math.max(1, config.fiveHourDurationHours || 5) * 3_600_000;
+  const poolEvents = filterEventsForPool(events, targetPool);
+  const cutlines: { tsMs: number; label: string }[] = config.customResets
+    .filter(
+      (r) =>
+        (r.scope === '5h' || r.scope === 'both') &&
+        doesResetApplyToPool(r.pool, targetPool),
+    )
+    .map((r) => ({ tsMs: Date.parse(r.timestamp), label: r.label }))
+    .filter((r) => !Number.isNaN(r.tsMs))
+    .sort((a, b) => a.tsMs - b.tsMs);
+
+  // Check if user synced an active future 5h reset anchor for this pool (or any pool in 'all' view)
+  const rawSyncedList =
+    targetPool === 'all'
+      ? [config.syncedNext5hReset.gemini, config.syncedNext5hReset.claude_gpt]
+      : [config.syncedNext5hReset[targetPool]];
+  const syncedCandidates = rawSyncedList
+    .filter((s): s is string => typeof s === 'string')
+    .map((s) => Date.parse(s))
+    .filter((ms) => !Number.isNaN(ms) && ms > nowMs && ms - durationMs <= nowMs);
+  const syncedEndMs = syncedCandidates.length > 0 ? Math.min(...syncedCandidates) : null;
+  const syncedStartMs = syncedEndMs !== null ? syncedEndMs - durationMs : null;
+
+  // Walk chronologically through token-bearing events to build rolling 5h windows
+  const tokenEvents = poolEvents.filter((e) => e.isTokenBearing);
+  const rawWindows: RawWindowDef[] = [];
+
+  let activeStart: number | null = null;
+  let activeEnd: number | null = null;
+  let activeIsSynced = false;
+  let activeStartedByReset = false;
+  let activeResetLabel: string | undefined;
+
+  let cutIdx = 0;
+
+  const advanceCutlinesUpTo = (limitMs: number) => {
+    while (cutIdx < cutlines.length && cutlines[cutIdx].tsMs <= limitMs) {
+      const cut = cutlines[cutIdx++];
+      if (activeStart !== null && activeEnd !== null) {
+        if (cut.tsMs > activeStart && cut.tsMs < activeEnd) {
+          // Close active window early at server reset cutline
+          rawWindows.push({
+            startMs: activeStart,
+            endMs: cut.tsMs,
+            isCurrent: false,
+            isSynced: activeIsSynced,
+            endedEarlyByServerReset: true,
+            startedByServerReset: activeStartedByReset,
+            serverResetLabel: activeResetLabel,
+          });
+          // Immediately open a fresh post-reset window starting at cutline
+          activeStart = cut.tsMs;
+          activeEnd = cut.tsMs + durationMs;
+          activeIsSynced = false;
+          activeStartedByReset = true;
+          activeResetLabel = cut.label;
+          continue;
+        }
+        if (cut.tsMs >= activeEnd) {
+          rawWindows.push({
+            startMs: activeStart,
+            endMs: activeEnd,
+            isCurrent: false,
+            isSynced: activeIsSynced,
+            endedEarlyByServerReset: false,
+            startedByServerReset: activeStartedByReset,
+            serverResetLabel: activeResetLabel,
+          });
+          activeStart = cut.tsMs;
+          activeEnd = cut.tsMs + durationMs;
+          activeIsSynced = false;
+          activeStartedByReset = true;
+          activeResetLabel = cut.label;
+          continue;
+        }
+      } else {
+        // No active window yet — open one anchored at the server reset cutline
+        activeStart = cut.tsMs;
+        activeEnd = cut.tsMs + durationMs;
+        activeIsSynced = false;
+        activeStartedByReset = true;
+        activeResetLabel = cut.label;
+      }
+    }
+  };
+
+  for (const ev of tokenEvents) {
+    // If synced active window starts before this event, flush prior window cleanly at syncedStartMs
+    if (
+      syncedStartMs !== null &&
+      syncedEndMs !== null &&
+      ev.tsMs >= syncedStartMs &&
+      (activeStart === null || activeStart < syncedStartMs)
+    ) {
+      advanceCutlinesUpTo(syncedStartMs);
+      if (activeStart !== null && activeEnd !== null) {
+        rawWindows.push({
+          startMs: activeStart,
+          endMs: Math.min(activeEnd, syncedStartMs),
+          isCurrent: false,
+          isSynced: activeIsSynced,
+          endedEarlyByServerReset: false,
+          startedByServerReset: activeStartedByReset,
+          serverResetLabel: activeResetLabel,
+        });
+      }
+      activeStart = syncedStartMs;
+      activeEnd = syncedEndMs;
+      activeIsSynced = true;
+      activeStartedByReset = false;
+      activeResetLabel = undefined;
+    }
+
+    advanceCutlinesUpTo(ev.tsMs);
+
+    if (activeStart === null || activeEnd === null) {
+      activeStart = ev.tsMs;
+      activeEnd = ev.tsMs + durationMs;
+      activeIsSynced = false;
+      activeStartedByReset = false;
+      activeResetLabel = undefined;
+    } else if (ev.tsMs >= activeEnd) {
+      rawWindows.push({
+        startMs: activeStart,
+        endMs: activeEnd,
+        isCurrent: false,
+        isSynced: activeIsSynced,
+        endedEarlyByServerReset: false,
+        startedByServerReset: activeStartedByReset,
+        serverResetLabel: activeResetLabel,
+      });
+      activeStart = ev.tsMs;
+      activeEnd = ev.tsMs + durationMs;
+      activeIsSynced = false;
+      activeStartedByReset = false;
+      activeResetLabel = undefined;
+    }
+  }
+
+  // Process any remaining cutlines up to nowMs (unless a newer synced window supersedes them)
+  if (syncedStartMs !== null && syncedEndMs !== null) {
+    if (activeStart === null || activeStart < syncedStartMs) {
+      advanceCutlinesUpTo(syncedStartMs);
+      if (activeStart !== null && activeEnd !== null) {
+        rawWindows.push({
+          startMs: activeStart,
+          endMs: Math.min(activeEnd, syncedStartMs),
+          isCurrent: false,
+          isSynced: activeIsSynced,
+          endedEarlyByServerReset: false,
+          startedByServerReset: activeStartedByReset,
+          serverResetLabel: activeResetLabel,
+        });
+      }
+      activeStart = syncedStartMs;
+      activeEnd = syncedEndMs;
+      activeIsSynced = true;
+      activeStartedByReset = false;
+      activeResetLabel = undefined;
+    }
+  } else {
+    advanceCutlinesUpTo(nowMs);
+  }
+
+  if (activeStart !== null && activeEnd !== null) {
+    const isActiveNow = nowMs >= activeStart && nowMs < activeEnd;
+    rawWindows.push({
+      startMs: activeStart,
+      endMs: activeEnd,
+      isCurrent: isActiveNow,
+      isSynced: activeIsSynced,
+      endedEarlyByServerReset: false,
+      startedByServerReset: activeStartedByReset,
+      serverResetLabel: activeResetLabel,
+    });
+  }
+
+  // Ensure there is always a current 5h window covering `nowMs`
+  if (!rawWindows.some((w) => w.isCurrent)) {
+    const hasSync = syncedStartMs !== null && syncedEndMs !== null;
+    rawWindows.push({
+      startMs: hasSync ? syncedStartMs! : nowMs,
+      endMs: hasSync ? syncedEndMs! : nowMs + durationMs,
+      isCurrent: true,
+      isIdle: !hasSync,
+      isSynced: hasSync,
+      endedEarlyByServerReset: false,
+      startedByServerReset: false,
+    });
+  }
+
+  return rawWindows;
+}
+
+function buildWeeklyWindows(
+  events: ResetStepEvent[],
+  config: ResetScheduleConfig,
+  nowMs: number,
+  targetPool: ResetEventPool,
+): RawWindowDef[] {
+  const WEEK_MS = 7 * 86_400_000;
+  const resetDay = config.weeklyResetDayUtc ?? 1;
+  const resetHour = config.weeklyResetHourUtc ?? 0;
+  const poolEvents = filterEventsForPool(events, targetPool);
+
+  const cutlines: { tsMs: number; label: string }[] = config.customResets
+    .filter(
+      (r) =>
+        (r.scope === 'weekly' || r.scope === 'both') &&
+        doesResetApplyToPool(r.pool, targetPool),
+    )
+    .map((r) => ({ tsMs: Date.parse(r.timestamp), label: r.label }))
+    .filter((r) => !Number.isNaN(r.tsMs))
+    .sort((a, b) => a.tsMs - b.tsMs);
+
+  // Determine synced anchor for this pool (or earliest synced in 'all' view)
+  const rawSyncedList =
+    targetPool === 'all'
+      ? [config.syncedNextWeeklyReset.gemini, config.syncedNextWeeklyReset.claude_gpt]
+      : [config.syncedNextWeeklyReset[targetPool]];
+  const syncedCandidates = rawSyncedList
+    .filter((s): s is string => typeof s === 'string')
+    .map((s) => Date.parse(s))
+    .filter((ms) => !Number.isNaN(ms) && ms > nowMs && ms - WEEK_MS <= nowMs);
+  const isSynced = syncedCandidates.length > 0;
+
+  // Check if a confirmed server reset occurred within the past 7 days for this pool.
+  // When Google issues a server reset, the pool gets a fresh 7-day weekly window from that cutline
+  // (unless overridden by a manual synced timer).
+  const recentServerCut =
+    !isSynced
+      ? cutlines.filter((c) => c.tsMs <= nowMs && c.tsMs + WEEK_MS > nowMs).at(-1) ?? null
+      : null;
+
+  const computeNextScheduledEnd = (refMs: number): number => {
+    const d = new Date(refMs);
+    const todayMidnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+    const curDow = d.getUTCDay();
+    const daysAhead = (resetDay - curDow + 7) % 7;
+    let candidate = todayMidnight + daysAhead * 86_400_000 + resetHour * 3_600_000;
+    if (candidate <= refMs) {
+      candidate += WEEK_MS;
+    }
+    return candidate;
+  };
+
+  const anchorEndMs = isSynced
+    ? Math.min(...syncedCandidates)
+    : recentServerCut
+      ? computeNextScheduledEnd(recentServerCut.tsMs)
+      : computeNextScheduledEnd(nowMs);
+
+  const earliestEventMs = poolEvents.length > 0 ? poolEvents[0].tsMs : nowMs;
+  let firstWeekStartMs = anchorEndMs - WEEK_MS;
+  let guard = 0;
+  while (firstWeekStartMs > earliestEventMs && guard < 104) {
+    firstWeekStartMs -= WEEK_MS;
+    guard += 1;
+  }
+
+  // Generate base weekly intervals up to anchorEndMs
+  const baseIntervals: { startMs: number; endMs: number }[] = [];
+  for (let s = firstWeekStartMs; s < anchorEndMs; s += WEEK_MS) {
+    baseIntervals.push({ startMs: s, endMs: s + WEEK_MS });
+  }
+
+  const windows: RawWindowDef[] = [];
+  for (const base of baseIntervals) {
+    if (recentServerCut && base.startMs >= recentServerCut.tsMs) {
+      continue;
+    }
+    const effectiveEnd =
+      recentServerCut && base.endMs > recentServerCut.tsMs ? recentServerCut.tsMs : base.endMs;
+    const closesAtRecentCut = Boolean(recentServerCut && effectiveEnd === recentServerCut.tsMs);
+
+    const insideCuts = cutlines.filter((c) => c.tsMs > base.startMs && c.tsMs < effectiveEnd);
+    if (insideCuts.length === 0) {
+      const isCur = !recentServerCut && nowMs >= base.startMs && nowMs < effectiveEnd;
+      windows.push({
+        startMs: base.startMs,
+        endMs: effectiveEnd,
+        isCurrent: isCur,
+        isSynced: isCur && isSynced,
+        endedEarlyByServerReset: closesAtRecentCut,
+        startedByServerReset: false,
+      });
+      continue;
+    }
+
+    let cursor = base.startMs;
+    let startedByReset = false;
+    let resetLabel: string | undefined;
+    for (const cut of insideCuts) {
+      windows.push({
+        startMs: cursor,
+        endMs: cut.tsMs,
+        isCurrent: !recentServerCut && nowMs >= cursor && nowMs < cut.tsMs,
+        endedEarlyByServerReset: true,
+        startedByServerReset: startedByReset,
+        serverResetLabel: resetLabel,
+      });
+      cursor = cut.tsMs;
+      startedByReset = true;
+      resetLabel = cut.label;
+    }
+    const isCur = !recentServerCut && nowMs >= cursor && nowMs < effectiveEnd;
+    windows.push({
+      startMs: cursor,
+      endMs: effectiveEnd,
+      isCurrent: isCur,
+      isSynced: isCur && isSynced,
+      endedEarlyByServerReset: closesAtRecentCut,
+      startedByServerReset: startedByReset,
+      serverResetLabel: resetLabel,
+    });
+  }
+
+  // Append the fresh 7-day post-reset current weekly window anchored at recentServerCut
+  if (recentServerCut) {
+    windows.push({
+      startMs: recentServerCut.tsMs,
+      endMs: recentServerCut.tsMs + WEEK_MS,
+      isCurrent: true,
+      isSynced: false,
+      endedEarlyByServerReset: false,
+      startedByServerReset: true,
+      serverResetLabel: recentServerCut.label,
+    });
+  }
+
+  return windows;
+}
+
+function buildLimitEstimates(
+  pools: Record<QuotaPool, PoolResetTimeline>,
+): PoolLimitEstimate[] {
+  const estimates: PoolLimitEstimate[] = [];
+  for (const pool of ['gemini', 'claude_gpt'] as const) {
+    const timeline = pools[pool];
+    for (const [scope, list] of [
+      ['5h', timeline.fiveHourCycles],
+      ['weekly', timeline.weeklyCycles],
+    ] as const) {
+      const matching = list.filter((c) =>
+        c.limitHits.some((h) => h.scope === scope && h.pool === pool),
+      );
+      if (matching.length === 0) continue;
+      let tokSum = 0;
+      let costSum = 0;
+      let turnSum = 0;
+      for (const c of matching) {
+        const pm = pool === 'gemini' ? c.gemini : c.claudeGpt;
+        tokSum += pm.tokens.totalTokens;
+        costSum += pm.cost.totalCost;
+        turnSum += pm.tokenSteps;
+      }
+      estimates.push({
+        pool,
+        scope,
+        sampleCount: matching.length,
+        avgTokensAtLimit: tokSum / matching.length,
+        avgCostAtLimit: costSum / matching.length,
+        avgTurnsAtLimit: turnSum / matching.length,
+      });
+    }
+  }
+  return estimates;
+}
+
+function buildPoolResetTimeline(
+  pool: QuotaPool,
+  events: ResetStepEvent[],
+  config: ResetScheduleConfig,
+  nowMs: number,
+): PoolResetTimeline {
+  const raw5h = buildFiveHourWindows(events, config, nowMs, pool);
+  const rawWeekly = buildWeeklyWindows(events, config, nowMs, pool);
+
+  const fiveHourCycles = raw5h
+    .map((def, idx) => aggregateCycle(def, '5h', events, config.limitHits, idx, pool))
+    .reverse()
+    .slice(0, 60);
+
+  const weeklyCycles = rawWeekly
+    .map((def, idx) => aggregateCycle(def, 'weekly', events, config.limitHits, idx, pool))
+    .reverse()
+    .slice(0, 26);
+
+  return {
+    pool,
+    current5h: fiveHourCycles.find((c) => c.isCurrent) ?? fiveHourCycles[0],
+    currentWeekly: weeklyCycles.find((c) => c.isCurrent) ?? weeklyCycles[0],
+    fiveHourCycles,
+    weeklyCycles,
+  };
+}
+
+function buildResetAnalytics(
+  dataset: LoadedDataset,
+  pricing: PricingConfig,
+  filters: {
+    includeSubagents: boolean;
+    projectId: string | null;
+    model: string | null;
+    search: string | null;
+  },
+  now: Date,
+): ResetAnalytics {
+  const config: ResetScheduleConfig = pricing.resetConfig ?? createDefaultResetConfig();
+  const nowMs = now.getTime();
+  const events: ResetStepEvent[] = [];
+
+  for (const conv of dataset.conversations.values()) {
+    const meta = conv.meta;
+    if (!filters.includeSubagents && meta.parentConversationId !== null) continue;
+    if (filters.projectId && meta.projectId !== filters.projectId) continue;
+    if (filters.search) {
+      const hay = [
+        meta.title,
+        meta.projectDisplayName,
+        meta.workspacePath ?? '',
+        meta.agentName ?? '',
+        meta.id,
+      ]
+        .join(' ')
+        .toLowerCase();
+      if (!hay.includes(filters.search)) continue;
+    }
+
+    const comp = computeDirectConversation(conv, pricing, null, null, filters.model);
+    for (const item of comp.filteredSteps) {
+      const tsStr = item.step.createdAt ?? meta.lastModifiedTime;
+      if (!tsStr) continue;
+      const tsMs = Date.parse(tsStr);
+      if (Number.isNaN(tsMs)) continue;
+      events.push({
+        tsMs,
+        conversationId: meta.id,
+        projectDisplayName: meta.projectDisplayName,
+        model: item.step.model,
+        pool: getQuotaPoolForModel(item.step.model, item.provider),
+        inputTokens: item.step.inputTokens,
+        cacheReadTokens: item.step.cacheReadTokens,
+        outputTokens: item.step.outputTokens,
+        cost: item.cost,
+        isTokenBearing: item.isTokenBearing,
+        hasError: item.step.hasError,
+        isCacheMissSpike: Boolean(item.step.isCacheMissSpike),
+      });
+    }
+  }
+
+  events.sort((a, b) => a.tsMs - b.tsMs);
+
+  // Combined (all-pools) timeline for overview bar presets & stacked charts
+  const raw5h = buildFiveHourWindows(events, config, nowMs, 'all');
+  const rawWeekly = buildWeeklyWindows(events, config, nowMs, 'all');
+
+  const fiveHourCycles = raw5h
+    .map((def, idx) => aggregateCycle(def, '5h', events, config.limitHits, idx, 'all'))
+    .reverse()
+    .slice(0, 60);
+
+  const weeklyCycles = rawWeekly
+    .map((def, idx) => aggregateCycle(def, 'weekly', events, config.limitHits, idx, 'all'))
+    .reverse()
+    .slice(0, 26);
+
+  const current5h = fiveHourCycles.find((c) => c.isCurrent) ?? fiveHourCycles[0];
+  const currentWeekly = weeklyCycles.find((c) => c.isCurrent) ?? weeklyCycles[0];
+
+  // Independent per-pool timelines matching Antigravity's separate Gemini vs Claude & GPT clocks
+  const pools: Record<QuotaPool, PoolResetTimeline> = {
+    gemini: buildPoolResetTimeline('gemini', events, config, nowMs),
+    claude_gpt: buildPoolResetTimeline('claude_gpt', events, config, nowMs),
+  };
+
+  const limitEstimates = buildLimitEstimates(pools);
+
+  return {
+    config,
+    current5h,
+    currentWeekly,
+    fiveHourCycles,
+    weeklyCycles,
+    pools,
+    limitEstimates,
+  };
+}

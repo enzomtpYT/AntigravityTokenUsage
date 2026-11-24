@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { buildConversationDetail, buildDashboardPayload } from '../server/analytics.ts';
 import type { LoadedConversation, LoadedDataset, RawStepRecord } from '../server/data-loader.ts';
+import { parseGeminiResetRss } from '../server/reset-feed.ts';
 import { createDefaultPricingConfig } from '../src/shared/pricing.ts';
 
 function makeStep(overrides: Partial<RawStepRecord> = {}): RawStepRecord {
@@ -416,5 +417,160 @@ describe('Analytics Engine', () => {
     expect(payload.toolChains.length).toBeGreaterThan(0);
     expect(payload.toolChains[0].from).toBe('read_file');
     expect(payload.toolChains[0].to).toBe('edit_file');
+  });
+
+  test('reconstructs 5h & weekly reset windows with dual pools, server-reset cutlines, and limit-hit estimates', () => {
+    const dataset = makeFixtureDataset();
+    const basePricing = createDefaultPricingConfig();
+
+    // Add a server-side reset cutline on Nov 22 at 15:15Z (splitting conv-main/conv-sub at 15:00–15:10Z
+    // from conv-grandchild at 15:20Z) plus a limit hit on Gemini 5h pool at 15:12Z
+    const pricing = {
+      ...basePricing,
+      resetConfig: {
+        ...basePricing.resetConfig,
+        customResets: [
+          {
+            id: 'rst-google-1',
+            timestamp: '2026-11-22T15:15:00.000Z',
+            scope: 'both' as const,
+            pool: 'all' as const,
+            label: 'Google bonus reset',
+          },
+        ],
+        limitHits: [
+          {
+            id: 'hit-1',
+            timestamp: '2026-11-22T15:12:00.000Z',
+            scope: '5h' as const,
+            pool: 'gemini' as const,
+            note: 'Hit 5h quota',
+          },
+        ],
+      },
+    };
+
+    const payload = buildDashboardPayload(
+      dataset,
+      pricing,
+      { includeSubagents: true },
+      new Date('2026-11-22T16:00:00.000Z'),
+    );
+
+    const ra = payload.resetAnalytics;
+    expect(ra.fiveHourCycles.length).toBeGreaterThanOrEqual(4);
+    expect(ra.weeklyCycles.length).toBeGreaterThanOrEqual(2);
+    expect(ra.current5h.isCurrent).toBe(true);
+    expect(ra.current5h.startedByServerReset).toBe(true);
+    expect(ra.current5h.serverResetLabel).toBe('Google bonus reset');
+    // Post-reset window starting at 15:15Z captures ONLY conv-grandchild (15:20Z -> 110,000 tokens)
+    expect(ra.current5h.combined.tokens.totalTokens).toBe(110_000);
+
+    // Prior 5h cycle on Nov 22 (15:00Z..15:15Z) was closed early by server reset and has the limit hit
+    const closedEarly5h = ra.fiveHourCycles.find((c) => c.endedEarlyByServerReset);
+    expect(closedEarly5h).toBeDefined();
+    expect(closedEarly5h!.gemini.tokens.totalTokens).toBe(1_175_000); // 155k + 1,020k
+    expect(closedEarly5h!.claudeGpt.tokens.totalTokens).toBe(0);
+    expect(closedEarly5h!.limitHits).toHaveLength(1);
+
+    // Weekly cycle was also split at 2026-11-22T15:15:00Z
+    expect(ra.currentWeekly.startedByServerReset).toBe(true);
+    expect(ra.weeklyCycles.some((c) => c.endedEarlyByServerReset)).toBe(true);
+
+    // Empirical limit estimate generated for Gemini 5h pool
+    const gemEst = ra.limitEstimates.find((e) => e.pool === 'gemini' && e.scope === '5h');
+    expect(gemEst).toBeDefined();
+    expect(gemEst!.sampleCount).toBe(1);
+    expect(gemEst!.avgCostAtLimit).toBeGreaterThan(0);
+  });
+
+  test('tracks independent per-pool reset clocks where Gemini-only resets do not alter Claude & GPT', () => {
+    const dataset = makeFixtureDataset();
+    const basePricing = createDefaultPricingConfig();
+
+    const claudeSyncEnd = '2026-11-28T12:00:00.000Z';
+    const pricing = {
+      ...basePricing,
+      resetConfig: {
+        ...basePricing.resetConfig,
+        syncedNextWeeklyReset: {
+          claude_gpt: claudeSyncEnd,
+        },
+        customResets: [
+          {
+            id: 'rst-gemini-only',
+            timestamp: '2026-11-22T15:15:00.000Z',
+            scope: 'both' as const,
+            pool: 'gemini' as const,
+            label: 'Gemini-only quota reset',
+          },
+        ],
+      },
+    };
+
+    const payload = buildDashboardPayload(
+      dataset,
+      pricing,
+      { includeSubagents: true },
+      new Date('2026-11-22T16:00:00.000Z'),
+    );
+
+    const { gemini, claude_gpt } = payload.resetAnalytics.pools;
+
+    // Gemini pool: cut by the Gemini-only reset -> 5h & 7-day weekly anchored at 2026-11-22T15:15:00Z
+    expect(gemini.current5h.startedByServerReset).toBe(true);
+    expect(gemini.current5h.startAt).toBe('2026-11-22T15:15:00.000Z');
+    expect(gemini.current5h.endAt).toBe('2026-11-22T20:15:00.000Z');
+    expect(gemini.current5h.isIdle).toBeUndefined();
+    expect(gemini.currentWeekly.startedByServerReset).toBe(true);
+    expect(gemini.currentWeekly.startAt).toBe('2026-11-22T15:15:00.000Z');
+    expect(gemini.currentWeekly.endAt).toBe('2026-11-29T15:15:00.000Z');
+
+    // Claude & GPT pool: untouched by Gemini-only reset!
+    // 5h has no Claude/GPT turns in the last 5h -> idle (100% ready)
+    expect(claude_gpt.current5h.startedByServerReset).toBe(false);
+    expect(claude_gpt.current5h.isIdle).toBe(true);
+    // Weekly uses its own synced countdown independently of Gemini
+    expect(claude_gpt.currentWeekly.startedByServerReset).toBe(false);
+    expect(claude_gpt.currentWeekly.isSynced).toBe(true);
+    expect(claude_gpt.currentWeekly.endAt).toBe(claudeSyncEnd);
+  });
+
+  test('parseGeminiResetRss extracts only confirmed resets and detects all-models vs gemini pool', () => {
+    const sampleXml = `<?xml version="1.0" encoding="UTF-8"?>
+      <rss version="2.0"><channel>
+        <item>
+          <title>[Reset] Neon + Carbon + Hydrogen quota reset for everyone</title>
+          <link>https://geminireset.com/history/#e-2026-11-23</link>
+          <guid isPermaLink="false">geminireset:2026-11-23:123</guid>
+          <pubDate>Mon, 23 Nov 2026 20:16:58 GMT</pubDate>
+          <category>Confirmed reset</category>
+          <description>Resetting Gemini quotas for everyone on Antigravity!</description>
+        </item>
+        <item>
+          <title>[Promised] Neon cache fix rolling out</title>
+          <link>https://geminireset.com/history/#e-2026-11-20</link>
+          <guid isPermaLink="false">geminireset:2026-11-20-promise:456</guid>
+          <pubDate>Fri, 20 Nov 2026 18:38:40 GMT</pubDate>
+          <category>Reset promised</category>
+          <description>Will issue a reset later.</description>
+        </item>
+        <item>
+          <title>[Reset] First-birthday reset across all models</title>
+          <link>https://geminireset.com/history/#e-2026-11-17</link>
+          <guid isPermaLink="false">geminireset:2026-11-17:789</guid>
+          <pubDate>Tue, 17 Nov 2026 23:38:48 GMT</pubDate>
+          <category>Confirmed reset</category>
+          <description>Resetting quota for everyone across all models!</description>
+        </item>
+      </channel></rss>`;
+
+    const parsed = parseGeminiResetRss(sampleXml);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0].label).toBe('Neon + Carbon + Hydrogen quota reset for everyone');
+    expect(parsed[0].pool).toBe('gemini');
+    expect(parsed[0].source).toBe('geminireset');
+    expect(parsed[0].sourceUrl).toBe('https://geminireset.com/history/#e-2026-11-23');
+    expect(parsed[1].pool).toBe('all');
   });
 });

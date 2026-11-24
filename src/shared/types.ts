@@ -5,6 +5,62 @@
 
 export type ModelProvider = 'google' | 'anthropic' | 'openai' | 'deepseek' | 'other';
 export type EfficiencyGrade = 'S' | 'A' | 'B' | 'C' | 'D';
+export type QuotaPool = 'gemini' | 'claude_gpt';
+export type ResetScope = '5h' | 'weekly' | 'both';
+export type ResetEventPool = 'all' | 'gemini' | 'claude_gpt';
+
+/**
+ * Ad-hoc server-side reset cutline (e.g. an unscheduled Google bonus reset).
+ * Closes the active cycle early and starts a fresh cycle from `timestamp`.
+ */
+export interface CustomResetMarker {
+  id: string;
+  timestamp: string;
+  scope: ResetScope;
+  pool: ResetEventPool;
+  label: string;
+  /** Origin of this marker: manually logged or synced from geminireset.com */
+  source?: 'manual' | 'geminireset';
+  /** Safe https link to the announcement (e.g. geminireset.com/history/#...) */
+  sourceUrl?: string;
+}
+
+/**
+ * Optional marker logged when a user hits quota exhaustion on a pool/scope,
+ * enabling empirical budget estimates (average tokens & API $ per cycle).
+ */
+export interface LimitHitMarker {
+  id: string;
+  timestamp: string;
+  scope: '5h' | 'weekly';
+  pool: QuotaPool;
+  note?: string;
+}
+
+/**
+ * User-configurable quota reset schedule, synced countdown anchors,
+ * ad-hoc server reset cutlines, and limit-hit markers.
+ */
+export interface ResetScheduleConfig {
+  /** Duration of rolling short-term window in hours (default 5) */
+  fiveHourDurationHours: number;
+  /** Weekly reset day of week in UTC (0 = Sun .. 6 = Sat, default 1 = Mon) */
+  weeklyResetDayUtc: number;
+  /** Weekly reset hour in UTC (0 .. 23, default 0) */
+  weeklyResetHourUtc: number;
+  /** Automatically fetch confirmed Google server resets from geminireset.com on server startup */
+  autoSyncOfficialResets: boolean;
+  /** ISO timestamp of the last successful official reset feed sync */
+  lastFeedSyncAt?: string;
+  /** Optional synced next 5h reset ISO timestamp per pool */
+  syncedNext5hReset: Partial<Record<QuotaPool, string>>;
+  /** Optional synced next weekly reset ISO timestamp per pool */
+  syncedNextWeeklyReset: Partial<Record<QuotaPool, string>>;
+  /** Ad-hoc server-side reset cutlines */
+  customResets: CustomResetMarker[];
+  /** Logged quota-exhaustion events */
+  limitHits: LimitHitMarker[];
+}
 
 /**
  * Per-model API rate configuration in USD per 1,000,000 tokens.
@@ -50,6 +106,8 @@ export interface PricingConfig {
   monthlySubscriptionUsd: number;
   /** Manual per-conversation model overrides: conversationId -> modelId */
   conversationModelOverrides: Record<string, string>;
+  /** Quota reset window schedule, synced anchors, server resets & limit hits */
+  resetConfig: ResetScheduleConfig;
 }
 
 /**
@@ -547,6 +605,87 @@ export interface PeriodDeltas {
 }
 
 /**
+ * Aggregated metrics for a single quota pool (or combined) inside a reset cycle.
+ */
+export interface PoolMetrics {
+  tokens: TokenTotals;
+  cost: CostTotals;
+  steps: number;
+  tokenSteps: number;
+  conversations: number;
+  topModel: string | null;
+  topProject: string | null;
+}
+
+/**
+ * Aggregated usage & API cost for a single 5-hour or weekly quota reset window.
+ */
+export interface ResetCycleSummary {
+  id: string;
+  scope: '5h' | 'weekly';
+  startAt: string;
+  endAt: string;
+  label: string;
+  isCurrent: boolean;
+  /** True when a 5h pool window currently has no active turns and no synced countdown (100% ready) */
+  isIdle?: boolean;
+  /** True when anchored by a user-synced countdown timer from Antigravity View Usage */
+  isSynced?: boolean;
+  /** True when the cycle ended early because of a logged server-side reset */
+  endedEarlyByServerReset: boolean;
+  /** True when the cycle began at a logged server-side reset cutline */
+  startedByServerReset: boolean;
+  serverResetLabel?: string;
+  limitHits: LimitHitMarker[];
+  combined: PoolMetrics;
+  gemini: PoolMetrics;
+  claudeGpt: PoolMetrics;
+  byModelCost: Record<string, number>;
+  byModelTokens: Record<string, number>;
+  efficiencyScore: number;
+  efficiencyGrade: EfficiencyGrade;
+}
+
+/**
+ * Independent reset timeline for a single Antigravity quota pool (Gemini vs Claude & GPT).
+ */
+export interface PoolResetTimeline {
+  pool: QuotaPool;
+  current5h: ResetCycleSummary;
+  currentWeekly: ResetCycleSummary;
+  fiveHourCycles: ResetCycleSummary[];
+  weeklyCycles: ResetCycleSummary[];
+}
+
+/**
+ * Empirical observed quota budget derived from logged limit-hit cycles.
+ */
+export interface PoolLimitEstimate {
+  pool: QuotaPool;
+  scope: '5h' | 'weekly';
+  sampleCount: number;
+  avgTokensAtLimit: number;
+  avgCostAtLimit: number;
+  avgTurnsAtLimit: number;
+}
+
+/**
+ * Full per-reset-window analytics payload for the Quota & Resets tab.
+ */
+export interface ResetAnalytics {
+  config: ResetScheduleConfig;
+  /** Combined current 5h cycle (all pools) */
+  current5h: ResetCycleSummary;
+  /** Combined current weekly cycle (all pools) */
+  currentWeekly: ResetCycleSummary;
+  fiveHourCycles: ResetCycleSummary[];
+  weeklyCycles: ResetCycleSummary[];
+  /** Independent per-pool reset clocks & histories (Gemini vs Claude & GPT) */
+  pools: Record<QuotaPool, PoolResetTimeline>;
+  limitEstimates: PoolLimitEstimate[];
+}
+
+/**
  * Active query filters applied to `/api/dashboard`.
  */
 export interface DashboardFilters {
@@ -630,6 +769,7 @@ export interface DashboardPayload {
   funInsights: FunInsights;
   periodDeltas: PeriodDeltas;
   toolChains: ToolChainStat[];
+  resetAnalytics: ResetAnalytics;
   sankey: SankeyData;
   scatterTurns: ScatterTurnPoint[];
   swarmAnalytics: SwarmAnalytics;

@@ -16,6 +16,9 @@ const ConversationsPage = lazy(() =>
 const SwarmsPage = lazy(() =>
   import('./pages/SwarmsPage').then((m) => ({ default: m.SwarmsPage })),
 );
+const ResetsPage = lazy(() =>
+  import('./pages/ResetsPage').then((m) => ({ default: m.ResetsPage })),
+);
 const ModelsPage = lazy(() =>
   import('./pages/ModelsPage').then((m) => ({ default: m.ModelsPage })),
 );
@@ -43,6 +46,7 @@ export function App() {
     setDatePreset,
     setStartDate,
     setEndDate,
+    applyTimeRange,
     setProjectId,
     setModel,
     setIncludeSubagents,
@@ -51,6 +55,8 @@ export function App() {
     refresh,
     savePricing,
     resetPricing,
+    saveResetConfig,
+    syncResetFeed,
     setConversationModelOverride,
     liveDelta,
     dismissLiveDelta,
@@ -176,6 +182,18 @@ export function App() {
               <SwarmsPage
                 data={data}
                 onSelectConversation={(id) => handleOpenConversation(id)}
+              />
+            )}
+
+            {activeTab === 'resets' && (
+              <ResetsPage
+                data={data}
+                onSaveResetConfig={saveResetConfig}
+                onSyncResetFeed={syncResetFeed}
+                onFilterToWindow={(startIso, endIso, label) => {
+                  applyTimeRange(startIso, endIso, label);
+                  setActiveTab('overview');
+                }}
               />
             )}
 

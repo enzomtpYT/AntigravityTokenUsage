@@ -36,6 +36,7 @@ src/
     ProjectsPage.tsx           # Spend Treemap + sortable workspace table
     ConversationsPage.tsx      # Expandable parent-child conversation tree
     SwarmsPage.tsx             # Swarm Gantt waterfall + agent role leaderboard
+    ResetsPage.tsx             # Quota & Resets (5h/weekly cycles, dual pools, server resets, limit hits)
     ModelsPage.tsx             # Subscription ROI, What-If simulator, editable rate card
     EfficiencyLabPage.tsx      # Efficiency grade, scatter plot, heatmaps, tool chains, outliers
   utils/

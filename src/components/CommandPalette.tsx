@@ -9,6 +9,7 @@ import {
   MessageSquareText,
   Network,
   Search,
+  Timer,
   X,
 } from 'lucide-react';
 import type { DashboardPayload } from '../shared/types';
@@ -64,6 +65,7 @@ export function CommandPalette({
       { id: 'projects', label: 'Projects', desc: 'Spend Treemap & workspace rollups', icon: <FolderKanban className="h-4 w-4" /> },
       { id: 'conversations', label: 'Conversations', desc: 'Chats, subagent trees & deep step inspector', icon: <MessageSquareText className="h-4 w-4" /> },
       { id: 'swarms', label: 'Swarms & Agents', desc: 'Gantt execution waterfall & agent roles', icon: <Network className="h-4 w-4" /> },
+      { id: 'resets', label: 'Quota & Resets', desc: '5h & weekly reset cycles, dual pools & server resets', icon: <Timer className="h-4 w-4" /> },
       { id: 'models', label: 'Models & Pricing', desc: 'Subscription ROI, What-If simulator & rate card', icon: <Coins className="h-4 w-4" /> },
       { id: 'efficiency', label: 'Efficiency Lab', desc: 'Cache-miss detector, scatter plot & heatmaps', icon: <FlaskConical className="h-4 w-4" /> },
     ];

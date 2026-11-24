@@ -28,6 +28,11 @@ A local, real-time analytics dashboard that reads your `~/.gemini/antigravity` t
 - **Swarms & Agents**:
   - **Interactive Swarm & Subagent Gantt Waterfall Timeline** showing coordinator + parallel worker lifespans overlapping in real time.
   - Spend & runs leaderboard by agent role (`@research`, `@browser`, `@verifier`, `@backend`, etc.) and parent-vs-child cost breakdown.
+- **Quota & Resets**:
+  - Independent live countdown cards for Antigravity's two separate quota pools (**Gemini Models** vs. **Claude & GPT Models**), each tracking its own **5-Hour Limit** (with `IDLE · 100% READY` state when inactive) and **Weekly Limit** clocks.
+  - **Hybrid Auto + Sync**: Auto-reconstructs rolling 5-hour cycles per pool from transcript timestamps, or lets you sync exact `"Resets in Xh Ym"` / `"Xd Yh"` countdowns independently per pool from Antigravity's *View Usage*.
+  - **Pool-Scoped Server Reset Cutlines, Startup Auto-Sync & Limit-Hit Markers**: Automatically syncs confirmed Google server-side resets from [`geminireset.com`](https://geminireset.com/feed.xml) on startup (toggleable), ensuring Gemini-only resets cut only the Gemini pool without disturbing Claude & GPT cycles, plus manual cutlines and limit hits to estimate empirical token/`$` quota budgets.
+  - Global **`5H`** and **`Cycle`** presets in the FilterBar + click any historical cycle bar/row to filter all dashboard tabs to that exact window.
 - **Models & Pricing**:
   - **Subscription ROI & Value Calculator** (`$20 / $100 / $200/mo` presets or custom plan).
   - **What-If Public API Cost Simulator** comparing your exact token workload across Gemini 2.5 Pro/Flash, Claude Opus/Sonnet 4.5, GPT-5, GPT-4.1, and DeepSeek R1.
@@ -132,5 +137,7 @@ Antigravity's `transcript.jsonl` records `input_tokens` (uncached fresh input) a
 | `/api/conversations/:id` | `GET` | Full step-by-step trace, costs, latencies, cache-miss flags, subagents, and ancestor breadcrumbs |
 | `/api/conversations/:id/model-override` | `PUT` | Persists a manual model tag `{ "modelId": "..." \| null }` for an untagged conversation |
 | `/api/pricing` | `GET` / `PUT` | Read or save pricing rates, fallback model, `>200K` tier rules, and subscription price |
+| `/api/resets` | `PUT` | Save quota reset schedule, synced countdown anchors, ad-hoc server reset cutlines, and limit-hit markers |
+| `/api/resets/sync-feed` | `POST` | Fetch and idempotently merge confirmed Google server resets from `https://geminireset.com/feed.xml` |
 | `/api/pricing/reset` | `POST` | Resets pricing overrides back to built-in defaults |
 | `/api/events` | `GET` | Server-Sent Events stream (`connected`, `update`, and `: ping` heartbeats) |

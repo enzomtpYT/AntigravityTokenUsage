@@ -25,10 +25,12 @@ export interface FilterBarProps {
   onResetFilters: () => void;
 }
 
-const PRESETS: { id: DatePreset; label: string }[] = [
-  { id: '7d', label: '7D' },
-  { id: '30d', label: '30D' },
-  { id: 'all', label: 'All' },
+const PRESETS: { id: DatePreset; label: string; title?: string }[] = [
+  { id: '5h', label: '5H', title: 'Current 5-hour quota reset window' },
+  { id: 'cycle', label: 'Cycle', title: 'Current weekly quota reset window' },
+  { id: '7d', label: '7D', title: 'Last 7 days' },
+  { id: '30d', label: '30D', title: 'Last 30 days' },
+  { id: 'all', label: 'All', title: 'All time' },
 ];
 
 export function FilterBar({
@@ -77,6 +79,7 @@ export function FilterBar({
             <button
               key={preset.id}
               type="button"
+              title={preset.title}
               onClick={() => onDatePresetChange(preset.id)}
               className={cn(
                 'rounded-md px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer',
@@ -91,25 +94,42 @@ export function FilterBar({
         })}
       </div>
 
-      {/* Custom Date Inputs */}
-      <div className="flex items-center gap-1.5 rounded-lg bg-[var(--bg-elevated)] px-2 py-1 border border-[var(--border-subtle)]">
-        <Calendar className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
-        <input
-          type="date"
-          aria-label="Start date"
-          value={filters.startDate}
-          onChange={(e) => onStartDateChange(e.target.value)}
-          className="mono-num bg-transparent text-xs text-[var(--text-primary)] outline-none w-[114px]"
-        />
-        <span className="text-xs text-[var(--text-muted)]">→</span>
-        <input
-          type="date"
-          aria-label="End date"
-          value={filters.endDate}
-          onChange={(e) => onEndDateChange(e.target.value)}
-          className="mono-num bg-transparent text-xs text-[var(--text-primary)] outline-none w-[114px]"
-        />
-      </div>
+      {/* Custom Date Inputs or Active Reset Window Pill */}
+      {filters.customRangeLabel ? (
+        <div className="flex items-center gap-1.5 rounded-lg bg-[var(--accent-primary)]/12 px-2.5 py-1 border border-[var(--accent-primary)]/35 text-xs">
+          <Calendar className="h-3.5 w-3.5 shrink-0 text-[var(--accent-primary)]" />
+          <span className="mono-num font-medium text-[var(--text-primary)] max-w-[230px] truncate">
+            {filters.customRangeLabel}
+          </span>
+          <button
+            type="button"
+            onClick={() => onDatePresetChange('all')}
+            aria-label="Clear reset window filter"
+            className="rounded p-0.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-1.5 rounded-lg bg-[var(--bg-elevated)] px-2 py-1 border border-[var(--border-subtle)]">
+          <Calendar className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
+          <input
+            type="date"
+            aria-label="Start date"
+            value={filters.startDate.slice(0, 10)}
+            onChange={(e) => onStartDateChange(e.target.value)}
+            className="mono-num bg-transparent text-xs text-[var(--text-primary)] outline-none w-[114px]"
+          />
+          <span className="text-xs text-[var(--text-muted)]">→</span>
+          <input
+            type="date"
+            aria-label="End date"
+            value={filters.endDate.slice(0, 10)}
+            onChange={(e) => onEndDateChange(e.target.value)}
+            className="mono-num bg-transparent text-xs text-[var(--text-primary)] outline-none w-[114px]"
+          />
+        </div>
+      )}
 
       {/* Project Selector */}
       <div className="relative flex items-center rounded-lg bg-[var(--bg-elevated)] px-2.5 py-1 border border-[var(--border-subtle)] hover:border-[var(--border-strong)] transition-colors">
