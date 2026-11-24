@@ -687,7 +687,7 @@ export function ConversationInspector({
                 Subagents ({subagents.length})
               </div>
             </div>
-            <div className="space-y-2 overflow-y-auto max-h-[540px] pr-1">
+            <div className="space-y-2 pr-1">
               {subagents.map((sub: ConversationSummary) => (
                 <button
                   key={sub.id}
@@ -769,9 +769,9 @@ export function ConversationInspector({
           </div>
         </div>
 
-        <div className="max-h-[560px] overflow-auto">
+        <div className="overflow-x-auto">
           <table className="w-full border-collapse text-left text-xs">
-            <thead className="sticky top-0 z-10 bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
+            <thead className="bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
               <tr>
                 <th className="px-3 py-2">Step</th>
                 <th className="px-3 py-2">Time</th>

@@ -823,7 +823,7 @@ export function EfficiencyLabPage({ data, onSelectConversation }: EfficiencyLabP
               Zero error steps recorded in this window.
             </div>
           ) : (
-            <div className="divide-y divide-[var(--border-subtle)] overflow-y-auto max-h-[290px]">
+            <div className="divide-y divide-[var(--border-subtle)]">
               {efficiency.errorCostByProject.map((p) => (
                 <div key={p.projectId} className="flex items-center justify-between py-2 text-xs">
                   <div className="min-w-0">

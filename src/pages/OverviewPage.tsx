@@ -16,6 +16,7 @@ import {
   MessageSquareText,
   MoonStar,
   Sparkles,
+  Timer,
   TrendingUp,
   Trophy,
   Zap,
@@ -23,9 +24,10 @@ import {
 import { EChart, useChartTheme } from '../components/EChart';
 import { KpiCard } from '../components/KpiCard';
 import type { NavTab } from '../components/Layout';
-import type { DashboardPayload } from '../shared/types';
+import type { DashboardPayload, ResetCycleSummary, TimeSeriesPoint } from '../shared/types';
 import {
   cn,
+  formatDateTime,
   formatDuration,
   formatModelLabel,
   formatMultiplier,
@@ -45,9 +47,10 @@ export interface OverviewPageProps {
   onSelectProject: (projectId: string) => void;
   onSelectConversation: (conversationId: string) => void;
   onNavigateTab: (tab: Exclude<NavTab, 'overview'>) => void;
+  onFilterToWindow: (startIso: string, endIso: string, label: string) => void;
 }
 
-type Granularity = 'daily' | 'hourly' | 'cumulative';
+type Granularity = 'daily' | 'hourly' | 'cumulative' | 'reset5h' | 'resetWeekly';
 type ChartMetric = 'cost' | 'tokens';
 type StackMode = 'tokenType' | 'model';
 
@@ -67,6 +70,7 @@ export function OverviewPage({
   onSelectProject,
   onSelectConversation,
   onNavigateTab,
+  onFilterToWindow,
 }: OverviewPageProps) {
   const [granularity, setGranularity] = useState<Granularity>('daily');
   const [metric, setMetric] = useState<ChartMetric>('cost');
@@ -74,7 +78,8 @@ export function OverviewPage({
   const [showMovingAvg, setShowMovingAvg] = useState(true);
   const theme = useChartTheme();
 
-  const { kpis, pricing, efficiency, subscriptionRoi, funInsights, periodDeltas } = data;
+  const { kpis, pricing, efficiency, subscriptionRoi, funInsights, periodDeltas, resetAnalytics } =
+    data;
 
   const totalTok = Math.max(kpis.tokens.totalTokens, 1);
   const uncachedPct = (kpis.tokens.uncachedInput / totalTok) * 100;
@@ -94,7 +99,77 @@ export function OverviewPage({
     return ids;
   }, [data.models]);
 
-  const seriesSource = granularity === 'hourly' ? data.hourlySeries : data.dailySeries;
+  const resetCycleSeries = useMemo<{
+    points: TimeSeriesPoint[];
+    cycles: ResetCycleSummary[];
+  }>(() => {
+    const raw =
+      granularity === 'reset5h'
+        ? resetAnalytics?.fiveHourCycles ?? []
+        : granularity === 'resetWeekly'
+          ? resetAnalytics?.weeklyCycles ?? []
+          : [];
+    const chronological = [...raw].slice(0, 32).reverse();
+    let runCost = 0;
+    const points: TimeSeriesPoint[] = chronological.map((c) => {
+      runCost += c.combined.cost.totalCost;
+      const prefix = c.startedByServerReset ? '⚡ ' : '';
+      const suffix = c.isCurrent ? ' ★' : '';
+      return {
+        bucket: c.id,
+        label: `${prefix}${c.label}${suffix}`,
+        uncachedInput: c.combined.tokens.uncachedInput,
+        cacheRead: c.combined.tokens.cacheRead,
+        output: c.combined.tokens.output,
+        totalTokens: c.combined.tokens.totalTokens,
+        totalCost: c.combined.cost.totalCost,
+        cumulativeCost: runCost,
+        cacheSavings: c.combined.cost.cacheSavings,
+        steps: c.combined.tokenSteps,
+        byModelCost: c.byModelCost,
+        byModelTokens: c.byModelTokens,
+        byProjectCost: c.byProjectCost ?? {},
+      };
+    });
+    return { points, cycles: chronological };
+  }, [granularity, resetAnalytics]);
+
+  const isResetGranularity = granularity === 'reset5h' || granularity === 'resetWeekly';
+  const seriesSource = isResetGranularity
+    ? resetCycleSeries.points
+    : granularity === 'hourly'
+      ? data.hourlySeries
+      : data.dailySeries;
+
+  // Quick Per-Reset summary metrics for the Overview Per-Reset Snapshot Strip
+  const resetSummary = useMemo(() => {
+    if (!resetAnalytics) return null;
+    const gem5h = resetAnalytics.pools?.gemini?.current5h ?? resetAnalytics.current5h;
+    const gemWeek = resetAnalytics.pools?.gemini?.currentWeekly ?? resetAnalytics.currentWeekly;
+    const active5h = resetAnalytics.fiveHourCycles.filter((c) => c.combined.tokenSteps > 0);
+    const activeWeekly = resetAnalytics.weeklyCycles.filter((c) => c.combined.tokenSteps > 0);
+    const avg5hCost =
+      active5h.length > 0
+        ? active5h.reduce((s, c) => s + c.combined.cost.totalCost, 0) / active5h.length
+        : 0;
+    const avgWeeklyCost =
+      activeWeekly.length > 0
+        ? activeWeekly.reduce((s, c) => s + c.combined.cost.totalCost, 0) / activeWeekly.length
+        : 0;
+    const latestServerReset =
+      [...(resetAnalytics.config.customResets ?? [])].sort(
+        (a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp),
+      )[0] ?? null;
+    return {
+      gem5h,
+      gemWeek,
+      active5hCount: active5h.length,
+      activeWeeklyCount: activeWeekly.length,
+      avg5hCost,
+      avgWeeklyCost,
+      latestServerReset,
+    };
+  }, [resetAnalytics]);
 
   // Build ECharts Time-Series option
   const timeSeriesOption = useMemo<EChartsCoreOption>(() => {
@@ -220,12 +295,18 @@ export function OverviewPage({
       }
     }
 
-    // Add 7-bucket moving average overlay for Daily/Hourly
+    // Add moving average overlay for Daily/Hourly/Per-Reset
     if (granularity !== 'cumulative' && showMovingAvg && seriesSource.length >= 3) {
       const rawTotals = seriesSource.map((p) => (metric === 'cost' ? p.totalCost : p.totalTokens));
-      const ma = computeMovingAverage(rawTotals, granularity === 'daily' ? 7 : 6);
+      const maWindow = granularity === 'daily' ? 7 : granularity === 'hourly' ? 6 : 4;
+      const ma = computeMovingAverage(rawTotals, maWindow);
       series.push({
-        name: granularity === 'daily' ? '7d Moving Avg' : '6h Moving Avg',
+        name:
+          granularity === 'daily'
+            ? '7d Moving Avg'
+            : granularity === 'hourly'
+              ? '6h Moving Avg'
+              : '4-Reset Avg',
         type: 'line',
         smooth: 0.3,
         symbol: 'none',
@@ -775,6 +856,141 @@ export function OverviewPage({
         </div>
       </section>
 
+      {/* Per-Reset Quick Snapshot Strip */}
+      {resetSummary && (
+        <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <button
+            type="button"
+            onClick={() =>
+              onFilterToWindow(
+                resetSummary.gem5h.startAt,
+                resetSummary.gem5h.endAt,
+                `5h Reset: ${resetSummary.gem5h.label}`,
+              )
+            }
+            className="surface-card group flex items-center justify-between rounded-xl px-4 py-3 text-left transition-colors hover:border-sky-500/40 cursor-pointer"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/12 text-sky-400">
+                <Timer className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="text-[11px] text-[var(--text-muted)]">Current 5h Reset</div>
+                <div className="mono-num text-sm font-semibold text-[var(--text-primary)]">
+                  {formatUsd(resetSummary.gem5h.combined.cost.totalCost)}
+                </div>
+              </div>
+            </div>
+            <div className="mono-num text-right text-[10px] text-[var(--text-secondary)]">
+              <div>{formatTokens(resetSummary.gem5h.combined.tokens.totalTokens)}</div>
+              <div className="text-[var(--text-muted)]">
+                {formatNumber(resetSummary.gem5h.combined.tokenSteps)} turns
+              </div>
+            </div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() =>
+              onFilterToWindow(
+                resetSummary.gemWeek.startAt,
+                resetSummary.gemWeek.endAt,
+                `Weekly Reset: ${resetSummary.gemWeek.label}`,
+              )
+            }
+            className="surface-card group flex items-center justify-between rounded-xl px-4 py-3 text-left transition-colors hover:border-indigo-500/40 cursor-pointer"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-500/12 text-indigo-400">
+                <CalendarDays className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="text-[11px] text-[var(--text-muted)]">Current Weekly Reset</div>
+                <div className="mono-num text-sm font-semibold text-[var(--text-primary)]">
+                  {formatUsd(resetSummary.gemWeek.combined.cost.totalCost)}
+                </div>
+              </div>
+            </div>
+            <div className="mono-num text-right text-[10px] text-[var(--text-secondary)]">
+              <div>{formatTokens(resetSummary.gemWeek.combined.tokens.totalTokens)}</div>
+              <div className="text-[var(--text-muted)]">
+                {formatNumber(resetSummary.gemWeek.combined.tokenSteps)} turns
+              </div>
+            </div>
+          </button>
+
+          {resetSummary.latestServerReset ? (
+            <button
+              type="button"
+              onClick={() =>
+                onFilterToWindow(
+                  resetSummary.latestServerReset!.timestamp,
+                  '',
+                  `Since ⚡ ${formatDateTime(resetSummary.latestServerReset!.timestamp)} → Today`,
+                )
+              }
+              className="surface-card group flex items-center justify-between rounded-xl px-4 py-3 text-left transition-colors hover:border-amber-500/40 cursor-pointer"
+              title={`Filter all tabs since ${resetSummary.latestServerReset.label} until today`}
+            >
+              <div className="flex items-center gap-3 min-w-0">
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/12 text-amber-400">
+                  <Zap className="h-4 w-4" />
+                </span>
+                <div className="min-w-0">
+                  <div className="text-[11px] text-[var(--text-muted)]">Since Last Server Reset</div>
+                  <div className="truncate text-xs font-semibold text-amber-300">
+                    {formatDateTime(resetSummary.latestServerReset.timestamp)} → Today
+                  </div>
+                </div>
+              </div>
+              <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)] group-hover:text-amber-300" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onNavigateTab('resets')}
+              className="surface-card group flex items-center justify-between rounded-xl px-4 py-3 text-left transition-colors hover:border-[var(--border-strong)] cursor-pointer"
+            >
+              <div className="flex items-center gap-3 min-w-0">
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/12 text-amber-400">
+                  <Zap className="h-4 w-4" />
+                </span>
+                <div className="min-w-0">
+                  <div className="text-[11px] text-[var(--text-muted)]">Server Reset Cutlines</div>
+                  <div className="text-xs font-semibold text-[var(--text-primary)]">
+                    Sync official resets
+                  </div>
+                </div>
+              </div>
+              <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => onNavigateTab('resets')}
+            className="surface-card group flex items-center justify-between rounded-xl px-4 py-3 text-left transition-colors hover:border-[var(--border-strong)] cursor-pointer"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/12 text-emerald-400">
+                <Sparkles className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="text-[11px] text-[var(--text-muted)]">Avg Spend per Reset</div>
+                <div className="mono-num text-sm font-semibold text-[var(--text-primary)]">
+                  {formatUsd(resetSummary.avg5hCost)}{' '}
+                  <span className="text-[11px] font-normal text-[var(--text-muted)]">/ 5h</span>
+                </div>
+              </div>
+            </div>
+            <div className="mono-num text-right text-[10px] text-[var(--text-secondary)]">
+              <div>{formatUsd(resetSummary.avgWeeklyCost, { compact: true })}/wk</div>
+              <div className="text-[var(--accent-primary)]">Resets →</div>
+            </div>
+          </button>
+        </section>
+      )}
+
       {/* Main Interactive Apache ECharts Time-Series */}
       <section className="surface-card rounded-xl p-4 sm:p-5">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -782,16 +998,22 @@ export function OverviewPage({
             <h2 className="text-sm font-semibold text-[var(--text-primary)]">
               {granularity === 'cumulative'
                 ? `Cumulative ${metric === 'cost' ? 'API Spend' : 'Token Volume'}`
-                : `${granularity === 'daily' ? 'Daily' : 'Hourly'} ${metric === 'cost' ? 'API Spend' : 'Token Usage'}`}
+                : granularity === 'reset5h'
+                  ? `Per 5-Hour Reset ${metric === 'cost' ? 'API Spend' : 'Token Usage'}`
+                  : granularity === 'resetWeekly'
+                    ? `Per Weekly Reset ${metric === 'cost' ? 'API Spend' : 'Token Usage'}`
+                    : `${granularity === 'daily' ? 'Daily' : 'Hourly'} ${metric === 'cost' ? 'API Spend' : 'Token Usage'}`}
             </h2>
             <p className="text-xs text-[var(--text-muted)] mt-0.5">
-              {granularity === 'cumulative'
-                ? 'Running total across the selected window (scroll or drag slider to zoom)'
-                : stackMode === 'model'
-                  ? 'Stacked by model · scroll or drag slider to zoom'
-                  : metric === 'cost'
-                    ? 'Estimated API spend vs. cache savings · dashed amber line = moving average'
-                    : 'Stacked by uncached input, cache read, and output tokens'}
+              {isResetGranularity
+                ? 'Aggregated per quota reset window · ⚡ marks server-reset cycles · click any bar to filter all tabs to that reset'
+                : granularity === 'cumulative'
+                  ? 'Running total across the selected window (scroll or drag slider to zoom)'
+                  : stackMode === 'model'
+                    ? 'Stacked by model · scroll or drag slider to zoom'
+                    : metric === 'cost'
+                      ? 'Estimated API spend vs. cache savings · dashed amber line = moving average'
+                      : 'Stacked by uncached input, cache read, and output tokens'}
             </p>
           </div>
 
@@ -803,6 +1025,8 @@ export function OverviewPage({
                   { id: 'daily', label: 'Daily' },
                   { id: 'hourly', label: 'Hourly' },
                   { id: 'cumulative', label: 'Cumulative' },
+                  { id: 'reset5h', label: '5h Resets' },
+                  { id: 'resetWeekly', label: 'Weekly Resets' },
                 ] as const
               ).map((opt) => (
                 <button
@@ -895,7 +1119,23 @@ export function OverviewPage({
           </div>
         ) : (
           <div className="h-[340px] w-full">
-            <EChart key={`${granularity}-${stackMode}`} option={timeSeriesOption} />
+            <EChart
+              key={`${granularity}-${stackMode}`}
+              option={timeSeriesOption}
+              onClick={(params) => {
+                if (!isResetGranularity) return;
+                const idx = (params as { dataIndex?: number })?.dataIndex;
+                if (typeof idx !== 'number') return;
+                const cycle = resetCycleSeries.cycles[idx];
+                if (cycle) {
+                  onFilterToWindow(
+                    cycle.startAt,
+                    cycle.endAt,
+                    `${cycle.scope === '5h' ? '5h' : 'Week'}: ${cycle.label}`,
+                  );
+                }
+              }}
+            />
           </div>
         )}
       </section>

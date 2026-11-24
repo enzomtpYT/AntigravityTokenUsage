@@ -17,9 +17,10 @@ import {
   Wrench,
 } from 'lucide-react';
 import { EChart, useChartTheme } from '../components/EChart';
-import type { DashboardPayload, ProjectSummary } from '../shared/types';
+import type { DashboardPayload, ProjectSummary, ResetCycleSummary } from '../shared/types';
 import {
   cn,
+  formatDateTime,
   formatDuration,
   formatModelLabel,
   formatNumber,
@@ -37,6 +38,7 @@ export interface ProjectsPageProps {
   defaultIncludeSubagents: boolean;
   onSelectConversation: (conversationId: string) => void;
   onFilterByProject: (projectId: string) => void;
+  onFilterToWindow: (startIso: string, endIso: string, label: string) => void;
 }
 
 type SortField =
@@ -50,7 +52,8 @@ type SortField =
   | 'lastActive';
 type SortDir = 'asc' | 'desc';
 type ChartMetric = 'cost' | 'tokens';
-type VisualMode = 'treemap' | 'bar';
+type VisualMode = 'treemap' | 'bar' | 'byReset';
+type ResetScopeMode = 'weekly' | '5h';
 
 const PROJECT_PALETTE = [
   '#6366f1',
@@ -77,12 +80,14 @@ export function ProjectsPage({
   defaultIncludeSubagents,
   onSelectConversation,
   onFilterByProject,
+  onFilterToWindow,
 }: ProjectsPageProps) {
   const [rollupMode, setRollupMode] = useState<'rolledUp' | 'direct'>(
     defaultIncludeSubagents ? 'rolledUp' : 'direct',
   );
   const [chartMetric, setChartMetric] = useState<ChartMetric>('cost');
   const [visualMode, setVisualMode] = useState<VisualMode>('treemap');
+  const [resetScopeMode, setResetScopeMode] = useState<ResetScopeMode>('weekly');
   const [colorByCache, setColorByCache] = useState(false);
   const [sortField, setSortField] = useState<SortField>('cost');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
@@ -379,6 +384,150 @@ export function ProjectsPage({
     };
   }, [data.projects, rollupMode, chartMetric, theme]);
 
+  const resetCyclesForChart = useMemo<ResetCycleSummary[]>(() => {
+    const raw =
+      resetScopeMode === '5h'
+        ? data.resetAnalytics?.fiveHourCycles ?? []
+        : data.resetAnalytics?.weeklyCycles ?? [];
+    return [...raw].slice(0, 24).reverse();
+  }, [data.resetAnalytics, resetScopeMode]);
+
+  const byResetOption = useMemo<EChartsCoreOption>(() => {
+    const projectTotals = new Map<string, number>();
+    for (const c of resetCyclesForChart) {
+      const map = chartMetric === 'cost' ? c.byProjectCost ?? {} : c.byProjectTokens ?? {};
+      for (const [proj, val] of Object.entries(map)) {
+        projectTotals.set(proj, (projectTotals.get(proj) ?? 0) + val);
+      }
+    }
+    const topProjectNames = [...projectTotals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([name]) => name);
+
+    const otherVals = resetCyclesForChart.map((c) => {
+      const map = chartMetric === 'cost' ? c.byProjectCost ?? {} : c.byProjectTokens ?? {};
+      let sum = 0;
+      for (const [proj, val] of Object.entries(map)) {
+        if (!topProjectNames.includes(proj)) sum += val;
+      }
+      return sum;
+    });
+    const hasOther = otherVals.some((v) => v > 0);
+
+    const series: Record<string, unknown>[] = topProjectNames.map((projName, idx) => {
+      const isTop = !hasOther && idx === topProjectNames.length - 1;
+      return {
+        name: projName,
+        type: 'bar',
+        stack: 'proj',
+        barMaxWidth: 28,
+        itemStyle: {
+          color: PROJECT_PALETTE[idx % PROJECT_PALETTE.length],
+          borderRadius: isTop ? [3, 3, 0, 0] : [0, 0, 0, 0],
+        },
+        data: resetCyclesForChart.map((c) => {
+          const map = chartMetric === 'cost' ? c.byProjectCost ?? {} : c.byProjectTokens ?? {};
+          return {
+            value: map[projName] ?? 0,
+            cycle: c,
+          };
+        }),
+      };
+    });
+
+    if (hasOther) {
+      series.push({
+        name: 'Other Projects',
+        type: 'bar',
+        stack: 'proj',
+        barMaxWidth: 28,
+        itemStyle: { color: '#94a3b8', borderRadius: [3, 3, 0, 0] },
+        data: resetCyclesForChart.map((c, idx) => ({
+          value: otherVals[idx],
+          cycle: c,
+        })),
+      });
+    }
+
+    const labels = resetCyclesForChart.map((c) => {
+      const prefix = c.startedByServerReset ? '⚡ ' : '';
+      const suffix = c.isCurrent ? ' ★' : '';
+      return `${prefix}${c.label}${suffix}`;
+    });
+
+    return {
+      backgroundColor: 'transparent',
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'shadow' },
+        backgroundColor: theme.tooltipBg,
+        borderColor: theme.tooltipBorder,
+        borderWidth: 1,
+        textStyle: { color: theme.textPrimary, fontSize: 12 },
+        formatter: (params: unknown) => {
+          const arr = Array.isArray(params) ? params : [];
+          if (!arr[0]) return '';
+          const idx = (arr[0] as { dataIndex: number }).dataIndex;
+          const cycle = resetCyclesForChart[idx];
+          if (!cycle) return '';
+          const safeMuted = sanitizeCssColor(theme.textMuted);
+          const safeSecondary = sanitizeCssColor(theme.textSecondary);
+          const safePrimary = sanitizeCssColor(theme.textPrimary);
+          const rows = arr
+            .filter((item) => Number((item as { value?: number }).value ?? 0) > 0)
+            .map((item) => {
+              const p = item as { seriesName: string; value: number; color: string };
+              const fmt = escapeHtml(
+                chartMetric === 'cost' ? formatUsd(p.value) : formatTokens(p.value),
+              );
+              const safeColor = sanitizeCssColor(p.color);
+              return `<div style="display:flex;align-items:center;justify-content:space-between;gap:14px;margin:2px 0;">
+                <span style="display:inline-flex;align-items:center;gap:6px;color:${safeSecondary};">
+                  <span style="width:8px;height:8px;border-radius:2px;background:${safeColor};display:inline-block;"></span>
+                  ${escapeHtml(p.seriesName)}
+                </span>
+                <span style="font-family:monospace;font-weight:600;color:${safePrimary};">${fmt}</span>
+              </div>`;
+            });
+          return `<div style="min-width:220px;">
+            <div style="font-weight:600;margin-bottom:2px;">${escapeHtml(cycle.label)}${cycle.isCurrent ? ' <span style="color:#34d399;">(Current)</span>' : ''}</div>
+            <div style="font-size:10px;color:${safeMuted};margin-bottom:6px;">${escapeHtml(formatDateTime(cycle.startAt))} → ${escapeHtml(formatDateTime(cycle.endAt))}</div>
+            ${rows.length > 0 ? rows.join('') : `<div style="font-size:11px;color:${safeMuted};">No project activity</div>`}
+            <div style="margin-top:5px;font-size:10px;color:${safeMuted};">Click bar to filter dashboard &amp; table to this reset</div>
+          </div>`;
+        },
+      },
+      legend: {
+        top: 0,
+        right: 0,
+        icon: 'roundRect',
+        itemWidth: 10,
+        itemHeight: 8,
+        textStyle: { color: theme.textSecondary, fontSize: 11 },
+      },
+      grid: { top: 34, left: 12, right: 16, bottom: 20, containLabel: true },
+      xAxis: {
+        type: 'category',
+        data: labels,
+        axisLine: { lineStyle: { color: theme.gridLine } },
+        axisTick: { show: false },
+        axisLabel: { color: theme.textMuted, fontSize: 10 },
+      },
+      yAxis: {
+        type: 'value',
+        splitLine: { lineStyle: { color: theme.gridLine, type: 'dashed' } },
+        axisLabel: {
+          color: theme.textMuted,
+          fontSize: 11,
+          formatter: (v: number) =>
+            chartMetric === 'cost' ? formatUsd(v, { compact: true }) : formatTokens(v),
+        },
+      },
+      series,
+    };
+  }, [resetCyclesForChart, chartMetric, theme]);
+
   const handleSort = (field: SortField) => {
     if (sortField === field) {
       setSortDir((d) => (d === 'desc' ? 'asc' : 'desc'));
@@ -411,12 +560,16 @@ export function ProjectsPage({
             <h2 className="text-sm font-semibold text-[var(--text-primary)]">
               {visualMode === 'treemap'
                 ? 'Interactive Spend Treemap (Project → Conversation)'
-                : 'Top Projects Comparison'}
+                : visualMode === 'byReset'
+                  ? `Project ${chartMetric === 'cost' ? 'Spend' : 'Tokens'} per ${resetScopeMode === '5h' ? '5-Hour' : 'Weekly'} Reset`
+                  : 'Top Projects Comparison'}
             </h2>
             <p className="text-xs text-[var(--text-muted)] mt-0.5">
               {visualMode === 'treemap'
                 ? 'Click a project to zoom in · click a conversation tile to open the Deep Inspector'
-                : 'Click a bar to expand project details below'}
+                : visualMode === 'byReset'
+                  ? 'Stacked by workspace across quota reset windows · ⚡ server reset · click any bar to filter all tabs'
+                  : 'Click a bar to expand project details below'}
             </p>
           </div>
 
@@ -447,7 +600,49 @@ export function ProjectsPage({
               >
                 Bar Chart
               </button>
+              <button
+                type="button"
+                onClick={() => setVisualMode('byReset')}
+                className={cn(
+                  'rounded-md px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer',
+                  visualMode === 'byReset'
+                    ? 'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-strong)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-transparent',
+                )}
+              >
+                By Reset
+              </button>
             </div>
+
+            {/* Reset Scope Toggle (when viewing By Reset) */}
+            {visualMode === 'byReset' && (
+              <div className="flex items-center rounded-lg bg-[var(--bg-elevated)] p-0.5 border border-[var(--border-subtle)]">
+                <button
+                  type="button"
+                  onClick={() => setResetScopeMode('weekly')}
+                  className={cn(
+                    'rounded-md px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer',
+                    resetScopeMode === 'weekly'
+                      ? 'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-strong)]'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-transparent',
+                  )}
+                >
+                  Weekly
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setResetScopeMode('5h')}
+                  className={cn(
+                    'rounded-md px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer',
+                    resetScopeMode === '5h'
+                      ? 'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-strong)]'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-transparent',
+                  )}
+                >
+                  5-Hour
+                </button>
+              </div>
+            )}
 
             {/* Direct vs Rolled-Up */}
             <div className="flex items-center rounded-lg bg-[var(--bg-elevated)] p-0.5 border border-[var(--border-subtle)]">
@@ -522,18 +717,39 @@ export function ProjectsPage({
           </div>
         </div>
 
-        {sortedProjects.length === 0 ? (
+        {(visualMode === 'byReset' ? resetCyclesForChart.length === 0 : sortedProjects.length === 0) ? (
           <div className="flex h-[320px] items-center justify-center rounded-lg border border-dashed border-[var(--border-subtle)] text-xs text-[var(--text-muted)]">
-            No projects match the current filters.
+            {visualMode === 'byReset'
+              ? 'No reset cycles match the current filters.'
+              : 'No projects match the current filters.'}
           </div>
         ) : (
           <div className="h-[360px] w-full">
             <EChart
-              key={visualMode}
-              option={visualMode === 'treemap' ? treemapOption : barOption}
+              key={`${visualMode}-${resetScopeMode}`}
+              option={
+                visualMode === 'treemap'
+                  ? treemapOption
+                  : visualMode === 'byReset'
+                    ? byResetOption
+                    : barOption
+              }
               onClick={(params) => {
-                const p = params as { data?: { conversationId?: string; projectId?: string } };
-                if (p?.data?.conversationId) {
+                const p = params as {
+                  data?: {
+                    conversationId?: string;
+                    projectId?: string;
+                    cycle?: ResetCycleSummary;
+                  };
+                };
+                if (visualMode === 'byReset' && p?.data?.cycle) {
+                  const c = p.data.cycle;
+                  onFilterToWindow(
+                    c.startAt,
+                    c.endAt,
+                    `${c.scope === '5h' ? '5h' : 'Week'}: ${c.label}`,
+                  );
+                } else if (p?.data?.conversationId) {
                   onSelectConversation(p.data.conversationId);
                 } else if (visualMode === 'bar' && p?.data?.projectId) {
                   setExpandedId((prev) =>
@@ -859,7 +1075,7 @@ export function ProjectsPage({
                                   </div>
                                   <span className="text-[11px] text-[var(--text-muted)]">Click any chat to inspect</span>
                                 </div>
-                                <div className="max-h-[260px] divide-y divide-[var(--border-subtle)] overflow-y-auto pr-1">
+                                <div className="divide-y divide-[var(--border-subtle)] pr-1">
                                   {projectConvs.slice(0, 20).map((conv) => {
                                     const cb = rollupMode === 'rolledUp' ? conv.rolledUp : conv.direct;
                                     return (

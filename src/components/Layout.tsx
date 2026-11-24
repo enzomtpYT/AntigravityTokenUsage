@@ -250,9 +250,9 @@ export function Layout({
   );
 
   return (
-    <div className="flex min-h-screen bg-[var(--bg-app)] text-[var(--text-primary)]">
-      {/* Desktop Sidebar */}
-      <aside className="hidden lg:fixed lg:inset-y-0 lg:left-0 lg:z-30 lg:flex lg:w-60 lg:flex-col bg-[var(--bg-surface)] border-r border-[var(--border-subtle)]">
+    <div className="flex min-h-screen w-full items-stretch bg-[var(--bg-app)] text-[var(--text-primary)]">
+      {/* Desktop Sidebar (sticky in flex flow so full-page screenshots capture cleanly) */}
+      <aside className="hidden lg:sticky lg:top-0 lg:z-30 lg:flex lg:h-screen lg:w-60 lg:shrink-0 lg:flex-col lg:self-start bg-[var(--bg-surface)] border-r border-[var(--border-subtle)]">
         {renderSidebarContent()}
       </aside>
 
@@ -270,9 +270,9 @@ export function Layout({
       )}
 
       {/* Main Content Area */}
-      <div className="flex min-w-0 flex-1 flex-col lg:pl-60">
-        {/* Top Bar */}
-        <header className="sticky top-0 z-20 flex items-center justify-between gap-3 bg-[var(--bg-app)]/85 px-4 py-3 backdrop-blur-md border-b border-[var(--border-subtle)] sm:px-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Top Bar (document flow to prevent sticky/backdrop-blur clipping in full-page screenshots) */}
+        <header className="flex items-center justify-between gap-3 bg-[var(--bg-app)] px-4 py-3 border-b border-[var(--border-subtle)] sm:px-6">
           <div className="flex items-center gap-3 min-w-0">
             <button
               type="button"

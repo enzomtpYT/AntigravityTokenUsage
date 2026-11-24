@@ -385,7 +385,7 @@ export function SwarmsPage({ data, onSelectConversation }: SwarmsPageProps) {
               <div className="h-[240px] w-full">
                 <EChart option={roleChartOption} />
               </div>
-              <div className="mt-3 max-h-[220px] overflow-y-auto divide-y divide-[var(--border-subtle)] text-xs">
+              <div className="mt-3 divide-y divide-[var(--border-subtle)] text-xs">
                 {swarmAnalytics.roleStats.map((r) => (
                   <div key={r.role} className="flex items-center justify-between py-2">
                     <div>
@@ -426,9 +426,9 @@ export function SwarmsPage({ data, onSelectConversation }: SwarmsPageProps) {
               No swarm sessions in this window.
             </div>
           ) : (
-            <div className="overflow-x-auto max-h-[500px] overflow-y-auto">
+            <div className="overflow-x-auto">
               <table className="w-full border-collapse text-left text-xs">
-                <thead className="sticky top-0 bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
+                <thead className="bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
                   <tr>
                     <th className="px-3.5 py-2.5">Session</th>
                     <th className="px-3 py-2.5 text-right">Workers</th>

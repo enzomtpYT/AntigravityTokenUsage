@@ -1,14 +1,26 @@
-import { useEffect, useRef, useState } from 'react';
-import { Calendar, Cpu, Download, Folder, GitBranch, RotateCcw, Search, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Calendar,
+  ChevronDown,
+  Cpu,
+  Download,
+  Folder,
+  GitBranch,
+  RotateCcw,
+  Search,
+  Timer,
+  X,
+  Zap,
+} from 'lucide-react';
 import type { DashboardFilterState, DatePreset } from '../hooks/useDashboardData';
-import type { DashboardPayload } from '../shared/types';
+import type { DashboardPayload, ResetCycleSummary, ResetEventPool } from '../shared/types';
 import {
   exportConversationsCsv,
   exportDashboardJson,
   exportModelsCsv,
   exportProjectsCsv,
 } from '../utils/export';
-import { cn } from '../utils/format';
+import { cn, formatDateTime, formatNumber, formatUsd } from '../utils/format';
 
 export interface FilterBarProps {
   filters: DashboardFilterState;
@@ -18,12 +30,16 @@ export interface FilterBarProps {
   onDatePresetChange: (preset: DatePreset) => void;
   onStartDateChange: (date: string) => void;
   onEndDateChange: (date: string) => void;
+  onApplyTimeRange: (startIso: string, endIso: string, label?: string) => void;
   onProjectChange: (projectId: string) => void;
   onModelChange: (model: string) => void;
   onIncludeSubagentsChange: (include: boolean) => void;
   onSearchChange: (search: string) => void;
   onResetFilters: () => void;
 }
+
+type ResetSourceTab = 'weekly' | '5h' | 'server';
+type ResetRangeMode = 'untilNext' | 'toToday';
 
 const PRESETS: { id: DatePreset; label: string; title?: string }[] = [
   { id: '5h', label: '5H', title: 'Current 5-hour quota reset window' },
@@ -41,6 +57,7 @@ export function FilterBar({
   onDatePresetChange,
   onStartDateChange,
   onEndDateChange,
+  onApplyTimeRange,
   onProjectChange,
   onModelChange,
   onIncludeSubagentsChange,
@@ -48,7 +65,12 @@ export function FilterBar({
   onResetFilters,
 }: FilterBarProps) {
   const [exportOpen, setExportOpen] = useState(false);
+  const [resetPickerOpen, setResetPickerOpen] = useState(false);
+  const [resetSource, setResetSource] = useState<ResetSourceTab>('weekly');
+  const [resetRangeMode, setResetRangeMode] = useState<ResetRangeMode>('untilNext');
+  const [resetPool, setResetPool] = useState<ResetEventPool>('all');
   const exportRef = useRef<HTMLDivElement | null>(null);
+  const resetPickerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!exportOpen) return;
@@ -60,6 +82,74 @@ export function FilterBar({
     window.addEventListener('mousedown', onDown);
     return () => window.removeEventListener('mousedown', onDown);
   }, [exportOpen]);
+
+  useEffect(() => {
+    if (!resetPickerOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (resetPickerRef.current && !resetPickerRef.current.contains(e.target as Node)) {
+        setResetPickerOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [resetPickerOpen]);
+
+  const pickerCycles = useMemo<ResetCycleSummary[]>(() => {
+    const ra = data?.resetAnalytics;
+    if (!ra) return [];
+    if (resetPool === 'gemini' && ra.pools?.gemini) {
+      return resetSource === '5h' ? ra.pools.gemini.fiveHourCycles : ra.pools.gemini.weeklyCycles;
+    }
+    if (resetPool === 'claude_gpt' && ra.pools?.claude_gpt) {
+      return resetSource === '5h'
+        ? ra.pools.claude_gpt.fiveHourCycles
+        : ra.pools.claude_gpt.weeklyCycles;
+    }
+    return resetSource === '5h' ? ra.fiveHourCycles : ra.weeklyCycles;
+  }, [data?.resetAnalytics, resetPool, resetSource]);
+
+  const pickerServerResets = useMemo(() => {
+    const raw = data?.resetAnalytics?.config?.customResets ?? [];
+    const filtered =
+      resetPool === 'all'
+        ? raw
+        : raw.filter((r) => r.pool === 'all' || r.pool === resetPool);
+    return [...filtered].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+  }, [data?.resetAnalytics?.config?.customResets, resetPool]);
+
+  const handlePickCycle = (cycle: ResetCycleSummary) => {
+    const poolTag =
+      resetPool === 'gemini' ? 'Gemini ' : resetPool === 'claude_gpt' ? 'Claude ' : '';
+    const scopeTag = cycle.scope === '5h' ? '5h' : 'Week';
+    if (resetRangeMode === 'toToday') {
+      onApplyTimeRange(
+        cycle.startAt,
+        '',
+        `Since ${poolTag}${scopeTag} (${formatDateTime(cycle.startAt)}) → Today`,
+      );
+    } else {
+      onApplyTimeRange(cycle.startAt, cycle.endAt, `${poolTag}${scopeTag}: ${cycle.label}`);
+    }
+    setResetPickerOpen(false);
+  };
+
+  const handlePickServerReset = (index: number) => {
+    const marker = pickerServerResets[index];
+    if (!marker) return;
+    const nextMarker = index > 0 ? pickerServerResets[index - 1] : null;
+    const startShort = formatDateTime(marker.timestamp);
+    if (resetRangeMode === 'toToday' || !nextMarker) {
+      onApplyTimeRange(marker.timestamp, '', `Since ⚡ ${startShort} → Today`);
+    } else {
+      const endShort = formatDateTime(nextMarker.timestamp);
+      onApplyTimeRange(
+        marker.timestamp,
+        nextMarker.timestamp,
+        `⚡ ${startShort} → ${endShort}`,
+      );
+    }
+    setResetPickerOpen(false);
+  };
   const hasActiveFilters =
     filters.datePreset !== 'all' ||
     filters.startDate !== '' ||
@@ -94,13 +184,204 @@ export function FilterBar({
         })}
       </div>
 
+      {/* By Reset Window Picker (Since reset -> Today OR Reset -> Next Reset) */}
+      {data?.resetAnalytics && (
+        <div className="relative" ref={resetPickerRef}>
+          <button
+            type="button"
+            onClick={() => setResetPickerOpen((v) => !v)}
+            className={cn(
+              'flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium border transition-colors cursor-pointer',
+              filters.customRangeLabel || resetPickerOpen
+                ? 'bg-[var(--accent-primary)]/12 border-[var(--accent-primary)]/40 text-[var(--accent-primary)]'
+                : 'bg-[var(--bg-elevated)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]',
+            )}
+            title="Filter all tabs from a specific reset until today, or from one reset until the next reset"
+          >
+            <Timer className="h-3.5 w-3.5" />
+            <span>By Reset</span>
+            <ChevronDown className="h-3 w-3 opacity-75" />
+          </button>
+
+          {resetPickerOpen && (
+            <div className="absolute left-0 z-40 mt-1.5 w-[380px] max-w-[92vw] rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] p-3 shadow-2xl space-y-2.5">
+              {/* Mode Toggle: Until Next Reset vs Since Reset -> Today */}
+              <div className="space-y-1">
+                <div className="text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                  Range Mode
+                </div>
+                <div className="grid grid-cols-2 gap-1 rounded-lg bg-[var(--bg-elevated)] p-0.5 border border-[var(--border-subtle)]">
+                  <button
+                    type="button"
+                    onClick={() => setResetRangeMode('untilNext')}
+                    className={cn(
+                      'rounded-md px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer',
+                      resetRangeMode === 'untilNext'
+                        ? 'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-strong)]'
+                        : 'text-[var(--text-secondary)] border border-transparent hover:text-[var(--text-primary)]',
+                    )}
+                  >
+                    Reset → Next Reset
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setResetRangeMode('toToday')}
+                    className={cn(
+                      'rounded-md px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer',
+                      resetRangeMode === 'toToday'
+                        ? 'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-strong)]'
+                        : 'text-[var(--text-secondary)] border border-transparent hover:text-[var(--text-primary)]',
+                    )}
+                  >
+                    Since Reset → Today
+                  </button>
+                </div>
+              </div>
+
+              {/* Source & Pool Selectors */}
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <div className="flex items-center rounded-lg bg-[var(--bg-elevated)] p-0.5 border border-[var(--border-subtle)]">
+                  {(
+                    [
+                      { id: 'weekly', label: 'Weekly' },
+                      { id: '5h', label: '5-Hour' },
+                      { id: 'server', label: '⚡ Server' },
+                    ] as const
+                  ).map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setResetSource(t.id)}
+                      className={cn(
+                        'rounded-md px-2 py-0.5 text-[11px] font-medium cursor-pointer',
+                        resetSource === t.id
+                          ? 'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-strong)]'
+                          : 'text-[var(--text-secondary)] border border-transparent hover:text-[var(--text-primary)]',
+                      )}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+
+                <select
+                  aria-label="Quota pool for reset picker"
+                  value={resetPool}
+                  onChange={(e) => setResetPool(e.target.value as ResetEventPool)}
+                  className="rounded-md border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-primary)] outline-none cursor-pointer"
+                >
+                  <option value="all">All Pools</option>
+                  <option value="gemini">Gemini Pool</option>
+                  <option value="claude_gpt">Claude &amp; GPT</option>
+                </select>
+              </div>
+
+              {/* Scrollable Reset List */}
+              <div className="max-h-[250px] overflow-y-auto divide-y divide-[var(--border-subtle)] rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)]/50">
+                {resetSource === 'server' ? (
+                  pickerServerResets.length === 0 ? (
+                    <div className="px-3 py-5 text-center text-[11px] text-[var(--text-muted)]">
+                      No server reset cutlines synced yet. Sync from Quota &amp; Resets tab.
+                    </div>
+                  ) : (
+                    pickerServerResets.map((marker, idx) => {
+                      const nextMarker = idx > 0 ? pickerServerResets[idx - 1] : null;
+                      return (
+                        <button
+                          key={marker.id}
+                          type="button"
+                          onClick={() => handlePickServerReset(idx)}
+                          className="flex w-full items-start justify-between gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--text-primary)]">
+                              <Zap className="h-3 w-3 shrink-0 text-amber-400" />
+                              <span className="truncate">{marker.label}</span>
+                            </div>
+                            <div className="mono-num mt-0.5 text-[10px] text-[var(--text-muted)]">
+                              {resetRangeMode === 'toToday' || !nextMarker
+                                ? `Since ${formatDateTime(marker.timestamp)} → Today`
+                                : `${formatDateTime(marker.timestamp)} → ${formatDateTime(nextMarker.timestamp)}`}
+                            </div>
+                          </div>
+                          <span className="shrink-0 rounded bg-amber-500/12 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+                            {marker.pool === 'all' ? 'All' : marker.pool === 'gemini' ? 'Gemini' : 'Claude'}
+                          </span>
+                        </button>
+                      );
+                    })
+                  )
+                ) : pickerCycles.length === 0 ? (
+                  <div className="px-3 py-5 text-center text-[11px] text-[var(--text-muted)]">
+                    No {resetSource === '5h' ? '5-hour' : 'weekly'} cycles found.
+                  </div>
+                ) : (
+                  pickerCycles.slice(0, 24).map((cycle) => {
+                    const pm =
+                      resetPool === 'gemini'
+                        ? cycle.gemini
+                        : resetPool === 'claude_gpt'
+                          ? cycle.claudeGpt
+                          : cycle.combined;
+                    return (
+                      <button
+                        key={cycle.id}
+                        type="button"
+                        onClick={() => handlePickCycle(cycle)}
+                        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--text-primary)]">
+                            <span className="mono-num truncate">{cycle.label}</span>
+                            {cycle.isCurrent && (
+                              <span className="rounded bg-emerald-500/15 px-1 py-0.2 text-[9px] font-semibold text-emerald-400">
+                                LIVE
+                              </span>
+                            )}
+                            {cycle.startedByServerReset && (
+                              <span className="rounded bg-amber-500/15 px-1 py-0.2 text-[9px] font-medium text-amber-400">
+                                ⚡
+                              </span>
+                            )}
+                          </div>
+                          <div className="mono-num mt-0.5 text-[10px] text-[var(--text-muted)]">
+                            {resetRangeMode === 'toToday'
+                              ? `Since ${formatDateTime(cycle.startAt)} → Today`
+                              : `${formatDateTime(cycle.startAt)} → ${formatDateTime(cycle.endAt)}`}
+                          </div>
+                        </div>
+                        <div className="mono-num shrink-0 text-right">
+                          <div className="text-xs font-semibold text-[var(--text-primary)]">
+                            {formatUsd(pm.cost.totalCost)}
+                          </div>
+                          <div className="text-[10px] text-[var(--text-muted)]">
+                            {formatNumber(pm.tokenSteps)} turns
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Custom Date Inputs or Active Reset Window Pill */}
       {filters.customRangeLabel ? (
         <div className="flex items-center gap-1.5 rounded-lg bg-[var(--accent-primary)]/12 px-2.5 py-1 border border-[var(--accent-primary)]/35 text-xs">
-          <Calendar className="h-3.5 w-3.5 shrink-0 text-[var(--accent-primary)]" />
-          <span className="mono-num font-medium text-[var(--text-primary)] max-w-[230px] truncate">
-            {filters.customRangeLabel}
-          </span>
+          <button
+            type="button"
+            onClick={() => setResetPickerOpen((v) => !v)}
+            className="flex items-center gap-1.5 cursor-pointer"
+            title="Click to change reset window or range mode"
+          >
+            <Calendar className="h-3.5 w-3.5 shrink-0 text-[var(--accent-primary)]" />
+            <span className="mono-num font-medium text-[var(--text-primary)] max-w-[260px] truncate">
+              {filters.customRangeLabel}
+            </span>
+          </button>
           <button
             type="button"
             onClick={() => onDatePresetChange('all')}

@@ -106,6 +106,7 @@ export function App() {
       onDatePresetChange={setDatePreset}
       onStartDateChange={setStartDate}
       onEndDateChange={setEndDate}
+      onApplyTimeRange={applyTimeRange}
       onProjectChange={setProjectId}
       onModelChange={setModel}
       onIncludeSubagentsChange={setIncludeSubagents}
@@ -155,6 +156,7 @@ export function App() {
                 onSelectProject={handleJumpToProject}
                 onSelectConversation={(id) => handleOpenConversation(id)}
                 onNavigateTab={(tab) => setActiveTab(tab)}
+                onFilterToWindow={(startIso, endIso, label) => applyTimeRange(startIso, endIso, label)}
               />
             )}
 
@@ -164,6 +166,7 @@ export function App() {
                 defaultIncludeSubagents={filters.includeSubagents}
                 onSelectConversation={(id) => handleOpenConversation(id)}
                 onFilterByProject={handleFilterProject}
+                onFilterToWindow={(startIso, endIso, label) => applyTimeRange(startIso, endIso, label)}
               />
             )}
 

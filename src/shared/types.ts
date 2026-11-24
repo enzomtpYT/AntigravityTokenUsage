@@ -642,6 +642,8 @@ export interface ResetCycleSummary {
   claudeGpt: PoolMetrics;
   byModelCost: Record<string, number>;
   byModelTokens: Record<string, number>;
+  byProjectCost: Record<string, number>;
+  byProjectTokens: Record<string, number>;
   efficiencyScore: number;
   efficiencyGrade: EfficiencyGrade;
 }

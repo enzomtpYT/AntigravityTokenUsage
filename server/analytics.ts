@@ -2336,6 +2336,8 @@ function aggregateCycle(
   const claudeAcc = createEmptyPoolAcc();
   const byModelCost: Record<string, number> = {};
   const byModelTokens: Record<string, number> = {};
+  const byProjectCost: Record<string, number> = {};
+  const byProjectTokens: Record<string, number> = {};
   let errorCount = 0;
   let cacheMissSpikes = 0;
 
@@ -2360,9 +2362,13 @@ function aggregateCycle(
       }
     }
     if (ev.isTokenBearing) {
+      const stepTokens = ev.inputTokens + ev.cacheReadTokens + ev.outputTokens;
       byModelCost[ev.model] = (byModelCost[ev.model] ?? 0) + ev.cost.totalCost;
-      byModelTokens[ev.model] =
-        (byModelTokens[ev.model] ?? 0) + ev.inputTokens + ev.cacheReadTokens + ev.outputTokens;
+      byModelTokens[ev.model] = (byModelTokens[ev.model] ?? 0) + stepTokens;
+      byProjectCost[ev.projectDisplayName] =
+        (byProjectCost[ev.projectDisplayName] ?? 0) + ev.cost.totalCost;
+      byProjectTokens[ev.projectDisplayName] =
+        (byProjectTokens[ev.projectDisplayName] ?? 0) + stepTokens;
     }
     if (ev.hasError) errorCount += 1;
     if (ev.isCacheMissSpike) cacheMissSpikes += 1;
@@ -2413,34 +2419,38 @@ function aggregateCycle(
     claudeGpt,
     byModelCost,
     byModelTokens,
+    byProjectCost,
+    byProjectTokens,
     efficiencyScore: eff.score,
     efficiencyGrade: eff.grade,
   };
 }
 
-function buildFiveHourWindows(
+function buildRollingWindows(
   events: ResetStepEvent[],
   config: ResetScheduleConfig,
   nowMs: number,
   targetPool: ResetEventPool,
+  scope: '5h' | 'weekly',
+  durationMs: number,
 ): RawWindowDef[] {
-  const durationMs = Math.max(1, config.fiveHourDurationHours || 5) * 3_600_000;
   const poolEvents = filterEventsForPool(events, targetPool);
   const cutlines: { tsMs: number; label: string }[] = config.customResets
     .filter(
       (r) =>
-        (r.scope === '5h' || r.scope === 'both') &&
+        (r.scope === scope || r.scope === 'both') &&
         doesResetApplyToPool(r.pool, targetPool),
     )
     .map((r) => ({ tsMs: Date.parse(r.timestamp), label: r.label }))
     .filter((r) => !Number.isNaN(r.tsMs))
     .sort((a, b) => a.tsMs - b.tsMs);
 
-  // Check if user synced an active future 5h reset anchor for this pool (or any pool in 'all' view)
+  // Check if user synced an active future reset anchor for this pool (or any pool in 'all' view)
+  const syncedMap = scope === '5h' ? config.syncedNext5hReset : config.syncedNextWeeklyReset;
   const rawSyncedList =
     targetPool === 'all'
-      ? [config.syncedNext5hReset.gemini, config.syncedNext5hReset.claude_gpt]
-      : [config.syncedNext5hReset[targetPool]];
+      ? [syncedMap.gemini, syncedMap.claude_gpt]
+      : [syncedMap[targetPool]];
   const syncedCandidates = rawSyncedList
     .filter((s): s is string => typeof s === 'string')
     .map((s) => Date.parse(s))
@@ -2448,8 +2458,9 @@ function buildFiveHourWindows(
   const syncedEndMs = syncedCandidates.length > 0 ? Math.min(...syncedCandidates) : null;
   const syncedStartMs = syncedEndMs !== null ? syncedEndMs - durationMs : null;
 
-  // Walk chronologically through token-bearing events to build rolling 5h windows
+  // Walk chronologically through token-bearing events to build rolling windows
   const tokenEvents = poolEvents.filter((e) => e.isTokenBearing);
+  const earliestEventMs = tokenEvents.length > 0 ? tokenEvents[0].tsMs : nowMs;
   const rawWindows: RawWindowDef[] = [];
 
   let activeStart: number | null = null;
@@ -2463,6 +2474,10 @@ function buildFiveHourWindows(
   const advanceCutlinesUpTo = (limitMs: number) => {
     while (cutIdx < cutlines.length && cutlines[cutIdx].tsMs <= limitMs) {
       const cut = cutlines[cutIdx++];
+      // Skip ancient pre-history server resets that expired before any local activity existed
+      if (activeStart === null && cut.tsMs + durationMs < earliestEventMs && cut.tsMs + durationMs <= nowMs) {
+        continue;
+      }
       if (activeStart !== null && activeEnd !== null) {
         if (cut.tsMs > activeStart && cut.tsMs < activeEnd) {
           // Close active window early at server reset cutline
@@ -2475,7 +2490,7 @@ function buildFiveHourWindows(
             startedByServerReset: activeStartedByReset,
             serverResetLabel: activeResetLabel,
           });
-          // Immediately open a fresh post-reset window starting at cutline
+          // Immediately open a fresh rolling post-reset window starting at cutline
           activeStart = cut.tsMs;
           activeEnd = cut.tsMs + durationMs;
           activeIsSynced = false;
@@ -2564,7 +2579,7 @@ function buildFiveHourWindows(
     }
   }
 
-  // Process any remaining cutlines up to nowMs (unless a newer synced window supersedes them)
+  // Process any remaining cutlines up to nowMs (unless a synced active window supersedes them)
   if (syncedStartMs !== null && syncedEndMs !== null) {
     if (activeStart === null || activeStart < syncedStartMs) {
       advanceCutlinesUpTo(syncedStartMs);
@@ -2602,7 +2617,7 @@ function buildFiveHourWindows(
     });
   }
 
-  // Ensure there is always a current 5h window covering `nowMs`
+  // Ensure there is always a current window covering `nowMs`
   if (!rawWindows.some((w) => w.isCurrent)) {
     const hasSync = syncedStartMs !== null && syncedEndMs !== null;
     rawWindows.push({
@@ -2619,6 +2634,16 @@ function buildFiveHourWindows(
   return rawWindows;
 }
 
+function buildFiveHourWindows(
+  events: ResetStepEvent[],
+  config: ResetScheduleConfig,
+  nowMs: number,
+  targetPool: ResetEventPool,
+): RawWindowDef[] {
+  const durationMs = Math.max(1, config.fiveHourDurationHours || 5) * 3_600_000;
+  return buildRollingWindows(events, config, nowMs, targetPool, '5h', durationMs);
+}
+
 function buildWeeklyWindows(
   events: ResetStepEvent[],
   config: ResetScheduleConfig,
@@ -2626,136 +2651,7 @@ function buildWeeklyWindows(
   targetPool: ResetEventPool,
 ): RawWindowDef[] {
   const WEEK_MS = 7 * 86_400_000;
-  const resetDay = config.weeklyResetDayUtc ?? 1;
-  const resetHour = config.weeklyResetHourUtc ?? 0;
-  const poolEvents = filterEventsForPool(events, targetPool);
-
-  const cutlines: { tsMs: number; label: string }[] = config.customResets
-    .filter(
-      (r) =>
-        (r.scope === 'weekly' || r.scope === 'both') &&
-        doesResetApplyToPool(r.pool, targetPool),
-    )
-    .map((r) => ({ tsMs: Date.parse(r.timestamp), label: r.label }))
-    .filter((r) => !Number.isNaN(r.tsMs))
-    .sort((a, b) => a.tsMs - b.tsMs);
-
-  // Determine synced anchor for this pool (or earliest synced in 'all' view)
-  const rawSyncedList =
-    targetPool === 'all'
-      ? [config.syncedNextWeeklyReset.gemini, config.syncedNextWeeklyReset.claude_gpt]
-      : [config.syncedNextWeeklyReset[targetPool]];
-  const syncedCandidates = rawSyncedList
-    .filter((s): s is string => typeof s === 'string')
-    .map((s) => Date.parse(s))
-    .filter((ms) => !Number.isNaN(ms) && ms > nowMs && ms - WEEK_MS <= nowMs);
-  const isSynced = syncedCandidates.length > 0;
-
-  // Check if a confirmed server reset occurred within the past 7 days for this pool.
-  // When Google issues a server reset, the pool gets a fresh 7-day weekly window from that cutline
-  // (unless overridden by a manual synced timer).
-  const recentServerCut =
-    !isSynced
-      ? cutlines.filter((c) => c.tsMs <= nowMs && c.tsMs + WEEK_MS > nowMs).at(-1) ?? null
-      : null;
-
-  const computeNextScheduledEnd = (refMs: number): number => {
-    const d = new Date(refMs);
-    const todayMidnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
-    const curDow = d.getUTCDay();
-    const daysAhead = (resetDay - curDow + 7) % 7;
-    let candidate = todayMidnight + daysAhead * 86_400_000 + resetHour * 3_600_000;
-    if (candidate <= refMs) {
-      candidate += WEEK_MS;
-    }
-    return candidate;
-  };
-
-  const anchorEndMs = isSynced
-    ? Math.min(...syncedCandidates)
-    : recentServerCut
-      ? computeNextScheduledEnd(recentServerCut.tsMs)
-      : computeNextScheduledEnd(nowMs);
-
-  const earliestEventMs = poolEvents.length > 0 ? poolEvents[0].tsMs : nowMs;
-  let firstWeekStartMs = anchorEndMs - WEEK_MS;
-  let guard = 0;
-  while (firstWeekStartMs > earliestEventMs && guard < 104) {
-    firstWeekStartMs -= WEEK_MS;
-    guard += 1;
-  }
-
-  // Generate base weekly intervals up to anchorEndMs
-  const baseIntervals: { startMs: number; endMs: number }[] = [];
-  for (let s = firstWeekStartMs; s < anchorEndMs; s += WEEK_MS) {
-    baseIntervals.push({ startMs: s, endMs: s + WEEK_MS });
-  }
-
-  const windows: RawWindowDef[] = [];
-  for (const base of baseIntervals) {
-    if (recentServerCut && base.startMs >= recentServerCut.tsMs) {
-      continue;
-    }
-    const effectiveEnd =
-      recentServerCut && base.endMs > recentServerCut.tsMs ? recentServerCut.tsMs : base.endMs;
-    const closesAtRecentCut = Boolean(recentServerCut && effectiveEnd === recentServerCut.tsMs);
-
-    const insideCuts = cutlines.filter((c) => c.tsMs > base.startMs && c.tsMs < effectiveEnd);
-    if (insideCuts.length === 0) {
-      const isCur = !recentServerCut && nowMs >= base.startMs && nowMs < effectiveEnd;
-      windows.push({
-        startMs: base.startMs,
-        endMs: effectiveEnd,
-        isCurrent: isCur,
-        isSynced: isCur && isSynced,
-        endedEarlyByServerReset: closesAtRecentCut,
-        startedByServerReset: false,
-      });
-      continue;
-    }
-
-    let cursor = base.startMs;
-    let startedByReset = false;
-    let resetLabel: string | undefined;
-    for (const cut of insideCuts) {
-      windows.push({
-        startMs: cursor,
-        endMs: cut.tsMs,
-        isCurrent: !recentServerCut && nowMs >= cursor && nowMs < cut.tsMs,
-        endedEarlyByServerReset: true,
-        startedByServerReset: startedByReset,
-        serverResetLabel: resetLabel,
-      });
-      cursor = cut.tsMs;
-      startedByReset = true;
-      resetLabel = cut.label;
-    }
-    const isCur = !recentServerCut && nowMs >= cursor && nowMs < effectiveEnd;
-    windows.push({
-      startMs: cursor,
-      endMs: effectiveEnd,
-      isCurrent: isCur,
-      isSynced: isCur && isSynced,
-      endedEarlyByServerReset: closesAtRecentCut,
-      startedByServerReset: startedByReset,
-      serverResetLabel: resetLabel,
-    });
-  }
-
-  // Append the fresh 7-day post-reset current weekly window anchored at recentServerCut
-  if (recentServerCut) {
-    windows.push({
-      startMs: recentServerCut.tsMs,
-      endMs: recentServerCut.tsMs + WEEK_MS,
-      isCurrent: true,
-      isSynced: false,
-      endedEarlyByServerReset: false,
-      startedByServerReset: true,
-      serverResetLabel: recentServerCut.label,
-    });
-  }
-
-  return windows;
+  return buildRollingWindows(events, config, nowMs, targetPool, 'weekly', WEEK_MS);
 }
 
 function buildLimitEstimates(

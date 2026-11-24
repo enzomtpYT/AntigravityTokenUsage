@@ -1277,9 +1277,9 @@ export function ResetsPage({
           </span>
         </div>
 
-        <div className="overflow-x-auto max-h-[520px] overflow-y-auto">
+        <div className="overflow-x-auto">
           <table className="w-full border-collapse text-left text-xs">
-            <thead className="sticky top-0 z-10 bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
+            <thead className="bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--text-muted)] border-b border-[var(--border-subtle)]">
               <tr>
                 <th className="px-4 py-2.5">Reset Window</th>
                 <th className="px-3 py-2.5 text-right">Combined</th>

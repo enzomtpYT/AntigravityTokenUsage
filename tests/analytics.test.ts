@@ -482,6 +482,79 @@ describe('Analytics Engine', () => {
     expect(gemEst).toBeDefined();
     expect(gemEst!.sampleCount).toBe(1);
     expect(gemEst!.avgCostAtLimit).toBeGreaterThan(0);
+
+    // Per-project breakdown inside each reset cycle
+    expect(ra.current5h.byProjectTokens['proj-a']).toBe(110_000);
+    expect(ra.current5h.byProjectCost['proj-a']).toBeGreaterThan(0);
+
+    // Global filtering "Since reset -> Today" (open-ended endDate) vs "Reset -> Next reset" (bounded)
+    const sinceReset = buildDashboardPayload(
+      dataset,
+      pricing,
+      { includeSubagents: true, startDate: '2026-11-22T15:15:00.000Z' },
+      new Date('2026-11-22T16:00:00.000Z'),
+    );
+    expect(sinceReset.kpis.tokens.totalTokens).toBe(110_000);
+
+    const betweenResets = buildDashboardPayload(
+      dataset,
+      pricing,
+      {
+        includeSubagents: true,
+        startDate: '2026-11-21T00:00:00.000Z',
+        endDate: '2026-11-22T15:15:00.000Z',
+      },
+      new Date('2026-11-22T16:00:00.000Z'),
+    );
+    // Captures Nov 21 conv-main step (1,010k) + Nov 22 conv-main step (155k) + conv-sub (1,020k) = 2,185,000
+    expect(betweenResets.kpis.tokens.totalTokens).toBe(2_185_000);
+  });
+
+  test('uses rolling 7-day weekly windows without phantom Monday UTC splits between server resets', () => {
+    const dataset = makeFixtureDataset();
+    const basePricing = createDefaultPricingConfig();
+
+    // Two server resets spanning Monday 00:00Z (Sat Nov 21 09:18Z -> Mon Nov 23 20:16Z)
+    const pricing = {
+      ...basePricing,
+      resetConfig: {
+        ...basePricing.resetConfig,
+        customResets: [
+          {
+            id: 'rst-sat',
+            timestamp: '2026-11-21T09:18:53.000Z',
+            scope: 'both' as const,
+            pool: 'all' as const,
+            label: 'Saturday server reset',
+          },
+          {
+            id: 'rst-mon',
+            timestamp: '2026-11-23T20:16:58.000Z',
+            scope: 'both' as const,
+            pool: 'all' as const,
+            label: 'Monday server reset',
+          },
+        ],
+      },
+    };
+
+    const payload = buildDashboardPayload(
+      dataset,
+      pricing,
+      { includeSubagents: true },
+      new Date('2026-11-24T00:00:00.000Z'),
+    );
+
+    const weeks = payload.resetAnalytics.weeklyCycles;
+    // Current window: Mon Nov 23 20:16:58Z -> Mon Nov 30 20:16:58Z
+    expect(weeks[0].startAt).toBe('2026-11-23T20:16:58.000Z');
+    expect(weeks[0].endAt).toBe('2026-11-30T20:16:58.000Z');
+    // Immediately preceding window must run straight from Sat Nov 21 09:18:53Z -> Mon Nov 23 20:16:58Z
+    // with NO phantom Monday 00:00Z cut in between!
+    expect(weeks[1].startAt).toBe('2026-11-21T09:18:53.000Z');
+    expect(weeks[1].endAt).toBe('2026-11-23T20:16:58.000Z');
+    expect(weeks[1].startedByServerReset).toBe(true);
+    expect(weeks[1].endedEarlyByServerReset).toBe(true);
   });
 
   test('tracks independent per-pool reset clocks where Gemini-only resets do not alter Claude & GPT', () => {
